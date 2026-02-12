@@ -3050,6 +3050,49 @@ fn generate_preview_for_path(
     Ok(Response::new(buf.into_inner()))
 }
 
+#[derive(Serialize)]
+struct LutFileInfo {
+    name: String,
+    path: String,
+}
+
+#[tauri::command]
+async fn list_lut_files(dir_path: String) -> Result<Vec<LutFileInfo>, String> {
+    let path = Path::new(&dir_path);
+    
+    if !path.exists() || !path.is_dir() {
+        return Err("Invalid directory path".to_string());
+    }
+    
+    let entries = fs::read_dir(path).map_err(|e| e.to_string())?;
+    let lut_extensions = ["cube", "3dl", "png", "jpg", "jpeg", "tiff"];
+    
+    let mut lut_files: Vec<LutFileInfo> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    if let Some(ext) = entry.path().extension() {
+                        let ext_str = ext.to_string_lossy().to_lowercase();
+                        return lut_extensions.contains(&ext_str.as_str());
+                    }
+                }
+            }
+            false
+        })
+        .map(|entry| {
+            let path_buf = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path = path_buf.to_string_lossy().to_string();
+            LutFileInfo { name, path }
+        })
+        .collect();
+    
+    lut_files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    
+    Ok(lut_files)
+}
+
 #[tauri::command]
 async fn load_and_parse_lut(
     path: String,
@@ -3367,6 +3410,7 @@ fn main() {
             save_panorama,
             apply_denoising,
             save_denoised_image,
+            list_lut_files,
             load_and_parse_lut,
             fetch_community_presets,
             generate_all_community_previews,
