@@ -5,7 +5,7 @@ use ::image::{
 };
 use iced::widget::{
     Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack,
-    text, tooltip,
+    text, text_input, tooltip,
 };
 use iced::{
     Background, Border, Color, Element, Font, Length, Point, Rectangle, Size, Subscription, Task,
@@ -98,6 +98,23 @@ enum Message {
     HoverLut(Option<usize>),
     ApplyLutFromBrowser(usize),
     SelectSidebarPage(SidebarPage),
+    ExportFormatChanged(ExportFileFormat),
+    ExportJpegQualityChanged(f32),
+    ExportResizeEnabledChanged(bool),
+    ExportResizeModeChanged(ExportResizeMode),
+    ExportResizeValueChanged(f32),
+    ExportDontEnlargeChanged(bool),
+    ExportKeepMetadataChanged(bool),
+    ExportStripGpsChanged(bool),
+    ExportMasksChanged(bool),
+    ExportWatermarkEnabledChanged(bool),
+    ExportWatermarkPathChanged(String),
+    ExportWatermarkAnchorChanged(WatermarkAnchor),
+    ExportWatermarkScaleChanged(f32),
+    ExportWatermarkSpacingChanged(f32),
+    ExportWatermarkOpacityChanged(f32),
+    TriggerExport,
+    ExportFinished(Result<ExportOutcome, String>),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
@@ -148,9 +165,12 @@ struct App {
     is_rendering_preview: bool,
     pending_preview_quality: Option<PreviewQuality>,
     renderer: Option<RapidRawRenderer>,
+    is_exporting: bool,
     undo_stack: Vec<UndoEntry>,
     pending_drag_undo: Option<UndoEntry>,
     sidebar_page: SidebarPage,
+    export_settings: ExportSettingsUi,
+    export_toggle_animations: ExportToggleAnimations,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +194,113 @@ enum UndoBehavior {
 enum SidebarPage {
     Adjustments,
     Export,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFileFormat {
+    Jpeg,
+    Png,
+    Tiff,
+    Webp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportResizeMode {
+    LongEdge,
+    ShortEdge,
+    Width,
+    Height,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatermarkAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    BottomRight,
+}
+
+#[derive(Debug, Clone)]
+struct ExportSettingsUi {
+    file_format: ExportFileFormat,
+    jpeg_quality: f32,
+    enable_resize: bool,
+    resize_mode: ExportResizeMode,
+    resize_value: f32,
+    dont_enlarge: bool,
+    keep_metadata: bool,
+    strip_gps: bool,
+    export_masks: bool,
+    enable_watermark: bool,
+    watermark_path: String,
+    watermark_anchor: WatermarkAnchor,
+    watermark_scale: f32,
+    watermark_spacing: f32,
+    watermark_opacity: f32,
+}
+
+impl Default for ExportSettingsUi {
+    fn default() -> Self {
+        Self {
+            file_format: ExportFileFormat::Jpeg,
+            jpeg_quality: 90.0,
+            enable_resize: false,
+            resize_mode: ExportResizeMode::LongEdge,
+            resize_value: 2048.0,
+            dont_enlarge: true,
+            keep_metadata: true,
+            strip_gps: true,
+            export_masks: false,
+            enable_watermark: false,
+            watermark_path: String::new(),
+            watermark_anchor: WatermarkAnchor::BottomRight,
+            watermark_scale: 10.0,
+            watermark_spacing: 5.0,
+            watermark_opacity: 75.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExportToggleAnimations {
+    enable_resize: f32,
+    dont_enlarge: f32,
+    keep_metadata: f32,
+    strip_gps: f32,
+    export_masks: f32,
+    enable_watermark: f32,
+}
+
+#[derive(Debug, Clone)]
+struct ExportJob {
+    path: PathBuf,
+    is_raw: bool,
+    adjustments: BasicAdjustments,
+}
+
+#[derive(Debug, Clone)]
+struct ExportOutcome {
+    exported_count: usize,
+    output_folder: PathBuf,
+}
+
+impl Default for ExportToggleAnimations {
+    fn default() -> Self {
+        let settings = ExportSettingsUi::default();
+        Self {
+            enable_resize: bool_to_progress(settings.enable_resize),
+            dont_enlarge: bool_to_progress(settings.dont_enlarge),
+            keep_metadata: bool_to_progress(settings.keep_metadata),
+            strip_gps: bool_to_progress(settings.strip_gps),
+            export_masks: bool_to_progress(settings.export_masks),
+            enable_watermark: bool_to_progress(settings.enable_watermark),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -424,9 +551,12 @@ impl App {
             is_rendering_preview: false,
             pending_preview_quality: None,
             renderer,
+            is_exporting: false,
             undo_stack: Vec::new(),
             pending_drag_undo: None,
             sidebar_page: SidebarPage::Adjustments,
+            export_settings: ExportSettingsUi::default(),
+            export_toggle_animations: ExportToggleAnimations::default(),
         };
 
         if let Some(sample) = app.samples.first() {
@@ -471,7 +601,7 @@ impl App {
             _ => None,
         });
 
-        if self.is_animating_cards() {
+        if self.is_animating_cards() || self.is_animating_toggles() {
             Subscription::batch(vec![
                 modifiers,
                 window::frames().map(Message::AnimationFrame),
@@ -567,6 +697,131 @@ impl App {
             Message::SelectSidebarPage(page) => {
                 self.sidebar_page = page;
             }
+            Message::ExportFormatChanged(format) => {
+                self.export_settings.file_format = format;
+            }
+            Message::ExportJpegQualityChanged(value) => {
+                self.export_settings.jpeg_quality = value;
+            }
+            Message::ExportResizeEnabledChanged(enabled) => {
+                self.export_settings.enable_resize = enabled;
+            }
+            Message::ExportResizeModeChanged(mode) => {
+                self.export_settings.resize_mode = mode;
+            }
+            Message::ExportResizeValueChanged(value) => {
+                self.export_settings.resize_value = value;
+            }
+            Message::ExportDontEnlargeChanged(enabled) => {
+                self.export_settings.dont_enlarge = enabled;
+            }
+            Message::ExportKeepMetadataChanged(enabled) => {
+                self.export_settings.keep_metadata = enabled;
+            }
+            Message::ExportStripGpsChanged(enabled) => {
+                self.export_settings.strip_gps = enabled;
+            }
+            Message::ExportMasksChanged(enabled) => {
+                self.export_settings.export_masks = enabled;
+            }
+            Message::ExportWatermarkEnabledChanged(enabled) => {
+                self.export_settings.enable_watermark = enabled;
+            }
+            Message::ExportWatermarkPathChanged(value) => {
+                self.export_settings.watermark_path = value;
+            }
+            Message::ExportWatermarkAnchorChanged(anchor) => {
+                self.export_settings.watermark_anchor = anchor;
+            }
+            Message::ExportWatermarkScaleChanged(value) => {
+                self.export_settings.watermark_scale = value;
+            }
+            Message::ExportWatermarkSpacingChanged(value) => {
+                self.export_settings.watermark_spacing = value;
+            }
+            Message::ExportWatermarkOpacityChanged(value) => {
+                self.export_settings.watermark_opacity = value;
+            }
+            Message::TriggerExport => {
+                self.finish_pending_drag_undo();
+                if self.is_exporting {
+                    return Task::none();
+                }
+
+                let indices = if self.selected_indices.is_empty() {
+                    vec![self.selected_index]
+                } else {
+                    self.selected_indices.iter().copied().collect::<Vec<_>>()
+                };
+
+                if indices.is_empty() {
+                    self.status_message = Some("No images selected for export.".to_string());
+                    return Task::none();
+                }
+
+                let Some(renderer) = self.renderer.clone() else {
+                    self.status_message = Some("GPU renderer is unavailable for export.".to_string());
+                    return Task::none();
+                };
+
+                let Some(output_folder) = rfd::FileDialog::new()
+                    .set_title("Choose Export Folder")
+                    .pick_folder()
+                else {
+                    self.status_message = Some("Export canceled.".to_string());
+                    return Task::none();
+                };
+
+                let jobs = indices
+                    .into_iter()
+                    .filter_map(|index| {
+                        self.samples.get(index).map(|sample| ExportJob {
+                            path: sample.path.clone(),
+                            is_raw: sample.is_raw,
+                            adjustments: sample.adjustments.clone(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                let export_count = jobs.len();
+                if export_count == 0 {
+                    self.status_message = Some("No images selected for export.".to_string());
+                    return Task::none();
+                }
+
+                self.is_exporting = true;
+                self.status_message = Some(format!(
+                    "Exporting {} image{}...",
+                    export_count,
+                    if export_count == 1 { "" } else { "s" }
+                ));
+
+                return Task::perform(
+                    export_images_task(
+                        output_folder,
+                        jobs,
+                        self.export_settings.clone(),
+                        renderer,
+                    ),
+                    Message::ExportFinished,
+                );
+            }
+            Message::ExportFinished(result) => {
+                self.is_exporting = false;
+                match result {
+                    Ok(outcome) => {
+                        self.status_message = Some(format!(
+                            "Exported {} image{} to {}.",
+                            outcome.exported_count,
+                            if outcome.exported_count == 1 { "" } else { "s" },
+                            outcome.output_folder.display()
+                        ));
+                    }
+                    Err(error) => {
+                        self.status_message = Some(error);
+                    }
+                }
+            }
             Message::SelectAllImages => {
                 self.finish_pending_drag_undo();
                 if self.route == Route::Editor && !self.samples.is_empty() {
@@ -638,6 +893,30 @@ impl App {
                 step_card_animation(&mut self.color_card);
                 step_card_animation(&mut self.details_card);
                 step_card_animation(&mut self.effects_card);
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.enable_resize,
+                    self.export_settings.enable_resize,
+                );
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.dont_enlarge,
+                    self.export_settings.dont_enlarge,
+                );
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.keep_metadata,
+                    self.export_settings.keep_metadata,
+                );
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.strip_gps,
+                    self.export_settings.strip_gps,
+                );
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.export_masks,
+                    self.export_settings.export_masks,
+                );
+                step_export_toggle_animation(
+                    &mut self.export_toggle_animations.enable_watermark,
+                    self.export_settings.enable_watermark,
+                );
             }
             Message::ToggleBasicCard => {
                 self.basic_card.expanded = !self.basic_card.expanded;
@@ -1268,6 +1547,33 @@ impl App {
                 > 0.01
     }
 
+    fn is_animating_toggles(&self) -> bool {
+        (self.export_toggle_animations.enable_resize
+            - bool_to_progress(self.export_settings.enable_resize))
+        .abs()
+            > 0.01
+            || (self.export_toggle_animations.dont_enlarge
+                - bool_to_progress(self.export_settings.dont_enlarge))
+            .abs()
+                > 0.01
+            || (self.export_toggle_animations.keep_metadata
+                - bool_to_progress(self.export_settings.keep_metadata))
+            .abs()
+                > 0.01
+            || (self.export_toggle_animations.strip_gps
+                - bool_to_progress(self.export_settings.strip_gps))
+            .abs()
+                > 0.01
+            || (self.export_toggle_animations.export_masks
+                - bool_to_progress(self.export_settings.export_masks))
+            .abs()
+                > 0.01
+            || (self.export_toggle_animations.enable_watermark
+                - bool_to_progress(self.export_settings.enable_watermark))
+            .abs()
+                > 0.01
+    }
+
     fn update_selected_adjustments(
         &mut self,
         undo_behavior: UndoBehavior,
@@ -1720,29 +2026,19 @@ impl App {
 
         let page_content: Element<'_, Message> = match self.sidebar_page {
             SidebarPage::Adjustments => self.view_adjustments_page(),
-            SidebarPage::Export => container(
-                text("Export page coming next.")
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
-            )
-            .padding([20, 14])
-            .width(Length::Fill)
-            .into(),
+            SidebarPage::Export => self.view_export_page(),
         };
 
-        let scroll_content: Element<'_, Message> = match self.sidebar_page {
-            SidebarPage::Adjustments => scrollable(page_content)
-                .direction(scrollable::Direction::Vertical(
-                    scrollable::Scrollbar::new()
-                        .width(4)
-                        .margin(0)
-                        .scroller_width(4),
-                ))
-                .style(discrete_scrollbar_style)
-                .height(Length::Fill)
-                .into(),
-            SidebarPage::Export => container(page_content).height(Length::Fill).into(),
-        };
+        let scroll_content: Element<'_, Message> = scrollable(page_content)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(4)
+                    .margin(0)
+                    .scroller_width(4),
+            ))
+            .style(discrete_scrollbar_style)
+            .height(Length::Fill)
+            .into();
 
         container(
             column![
@@ -2175,7 +2471,7 @@ impl App {
                             Message::LutIntensityChanged,
                         )
                     } else {
-                        Space::with_height(Length::Shrink).into()
+                        Element::from(Space::with_height(Length::Shrink))
                     },
                     if self.lut_browser.folder.is_some() {
                         lut_browser_list(
@@ -2183,7 +2479,7 @@ impl App {
                             self.basic_adjustments.lut_path.as_deref(),
                         )
                     } else {
-                        Space::with_height(Length::Shrink).into()
+                        Element::from(Space::with_height(Length::Shrink))
                     },
                 ]
                 .spacing(10)
@@ -2290,6 +2586,250 @@ impl App {
                 Message::ToggleEffectsCard,
                 effects_body.into(),
                 700.0
+            ),
+        ]
+        .spacing(16);
+
+        container(controls)
+            .padding([20, 14])
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_export_page(&self) -> Element<'_, Message> {
+        let settings = &self.export_settings;
+        let selection_count = self.selected_indices.len().max(1);
+        let estimated_bytes = self
+            .samples
+            .get(self.selected_index)
+            .map(|sample| estimate_export_bytes(sample, settings) * selection_count as u64)
+            .unwrap_or(0);
+
+        let controls = column![
+            card_section(
+                "File Settings",
+                column![
+                    export_option_row(
+                        "Format",
+                        row![
+                            export_choice_button("JPEG", settings.file_format == ExportFileFormat::Jpeg, Message::ExportFormatChanged(ExportFileFormat::Jpeg)),
+                            export_choice_button("PNG", settings.file_format == ExportFileFormat::Png, Message::ExportFormatChanged(ExportFileFormat::Png)),
+                            export_choice_button("TIFF", settings.file_format == ExportFileFormat::Tiff, Message::ExportFormatChanged(ExportFileFormat::Tiff)),
+                            export_choice_button("WebP", settings.file_format == ExportFileFormat::Webp, Message::ExportFormatChanged(ExportFileFormat::Webp)),
+                        ]
+                        .spacing(8)
+                        .into()
+                    ),
+                    if settings.file_format == ExportFileFormat::Jpeg {
+                        basic_slider(
+                            "Quality",
+                            1.0,
+                            100.0,
+                            settings.jpeg_quality,
+                            Message::ExportJpegQualityChanged,
+                        )
+                    } else {
+                        Element::from(Space::with_height(Length::Shrink))
+                    },
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Image Sizing",
+                column![
+                    export_toggle_row(
+                        "Resize",
+                        settings.enable_resize,
+                        self.export_toggle_animations.enable_resize,
+                        Message::ExportResizeEnabledChanged(!settings.enable_resize),
+                    ),
+                    if settings.enable_resize {
+                        column![
+                            export_option_row(
+                                "Mode",
+                                row![
+                                    export_choice_button("Long Edge", settings.resize_mode == ExportResizeMode::LongEdge, Message::ExportResizeModeChanged(ExportResizeMode::LongEdge)),
+                                    export_choice_button("Short Edge", settings.resize_mode == ExportResizeMode::ShortEdge, Message::ExportResizeModeChanged(ExportResizeMode::ShortEdge)),
+                                ]
+                                .spacing(8)
+                                .into()
+                            ),
+                            row![
+                                export_choice_button("Width", settings.resize_mode == ExportResizeMode::Width, Message::ExportResizeModeChanged(ExportResizeMode::Width)),
+                                export_choice_button("Height", settings.resize_mode == ExportResizeMode::Height, Message::ExportResizeModeChanged(ExportResizeMode::Height)),
+                            ]
+                            .spacing(8),
+                            basic_slider(
+                                "Target Size",
+                                256.0,
+                                6000.0,
+                                settings.resize_value,
+                                Message::ExportResizeValueChanged,
+                            ),
+                            export_toggle_row(
+                                "Don't Enlarge",
+                                settings.dont_enlarge,
+                                self.export_toggle_animations.dont_enlarge,
+                                Message::ExportDontEnlargeChanged(!settings.dont_enlarge),
+                            ),
+                        ]
+                        .spacing(12)
+                        .into()
+                    } else {
+                        Element::from(Space::with_height(Length::Shrink))
+                    },
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Metadata",
+                column![
+                    export_toggle_row(
+                        "Keep Metadata",
+                        settings.keep_metadata,
+                        self.export_toggle_animations.keep_metadata,
+                        Message::ExportKeepMetadataChanged(!settings.keep_metadata),
+                    ),
+                    export_toggle_row(
+                        "Strip GPS",
+                        settings.strip_gps,
+                        self.export_toggle_animations.strip_gps,
+                        Message::ExportStripGpsChanged(!settings.strip_gps),
+                    ),
+                    export_toggle_row(
+                        "Export Masks",
+                        settings.export_masks,
+                        self.export_toggle_animations.export_masks,
+                        Message::ExportMasksChanged(!settings.export_masks),
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Watermark",
+                column![
+                    export_toggle_row(
+                        "Enable Watermark",
+                        settings.enable_watermark,
+                        self.export_toggle_animations.enable_watermark,
+                        Message::ExportWatermarkEnabledChanged(!settings.enable_watermark),
+                    ),
+                    if settings.enable_watermark {
+                        column![
+                            export_option_row(
+                                "Watermark Path",
+                                text_input("Path to watermark", &settings.watermark_path)
+                                    .on_input(Message::ExportWatermarkPathChanged)
+                                    .padding([10, 12])
+                                    .size(14)
+                                    .into(),
+                            ),
+                            export_option_row(
+                                "Anchor",
+                                column![
+                                    row![
+                                        export_choice_button("TL", settings.watermark_anchor == WatermarkAnchor::TopLeft, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::TopLeft)),
+                                        export_choice_button("TC", settings.watermark_anchor == WatermarkAnchor::TopCenter, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::TopCenter)),
+                                        export_choice_button("TR", settings.watermark_anchor == WatermarkAnchor::TopRight, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::TopRight)),
+                                    ]
+                                    .spacing(8),
+                                    row![
+                                        export_choice_button("CL", settings.watermark_anchor == WatermarkAnchor::CenterLeft, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::CenterLeft)),
+                                        export_choice_button("C", settings.watermark_anchor == WatermarkAnchor::Center, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::Center)),
+                                        export_choice_button("CR", settings.watermark_anchor == WatermarkAnchor::CenterRight, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::CenterRight)),
+                                    ]
+                                    .spacing(8),
+                                    row![
+                                        export_choice_button("BL", settings.watermark_anchor == WatermarkAnchor::BottomLeft, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::BottomLeft)),
+                                        export_choice_button("BC", settings.watermark_anchor == WatermarkAnchor::BottomCenter, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::BottomCenter)),
+                                        export_choice_button("BR", settings.watermark_anchor == WatermarkAnchor::BottomRight, Message::ExportWatermarkAnchorChanged(WatermarkAnchor::BottomRight)),
+                                    ]
+                                    .spacing(8),
+                                ]
+                                .spacing(8)
+                                .into(),
+                            ),
+                            basic_slider(
+                                "Scale",
+                                1.0,
+                                100.0,
+                                settings.watermark_scale,
+                                Message::ExportWatermarkScaleChanged,
+                            ),
+                            basic_slider(
+                                "Spacing",
+                                0.0,
+                                50.0,
+                                settings.watermark_spacing,
+                                Message::ExportWatermarkSpacingChanged,
+                            ),
+                            basic_slider(
+                                "Opacity",
+                                0.0,
+                                100.0,
+                                settings.watermark_opacity,
+                                Message::ExportWatermarkOpacityChanged,
+                            ),
+                        ]
+                        .spacing(12)
+                        .into()
+                    } else {
+                        Element::from(Space::with_height(Length::Shrink))
+                    },
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Export",
+                column![
+                    row![
+                        column![
+                            text("Estimated Size")
+                                .size(14)
+                                .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                            text(format_estimated_size(estimated_bytes))
+                                .size(18)
+                                .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+                        ]
+                        .spacing(4),
+                        Space::with_width(Length::Fill),
+                        text(format!("{} image{}", selection_count, if selection_count == 1 { "" } else { "s" }))
+                            .size(13)
+                            .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
+                    ]
+                    .align_y(iced::alignment::Vertical::Center),
+                    {
+                        let mut export_button = button(
+                        row![
+                            app_icon(AppIcon::Share, 16.0, Color::WHITE),
+                            text(if self.is_exporting { "Exporting..." } else { "Export" })
+                                .size(14)
+                                .color(Color::WHITE),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::alignment::Vertical::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([10, 12])
+                    .style(|theme, status| {
+                        let mut style = iced::widget::button::secondary(theme, status);
+                        style.background = Some(Background::Color(Color::from_rgb8(0x24, 0x5d, 0x88)));
+                        style.text_color = Color::WHITE;
+                        style.border.radius = 12.0.into();
+                        style
+                    });
+                        if !self.is_exporting {
+                            export_button = export_button.on_press(Message::TriggerExport);
+                        }
+                        export_button
+                    },
+                ]
+                .spacing(12)
+                .into(),
             ),
         ]
         .spacing(16);
@@ -3340,6 +3880,297 @@ fn set_hsl_value(value: &mut HueSatLum, field: HslField, amount: f32) {
     }
 }
 
+fn estimate_export_bytes(sample: &SampleImage, settings: &ExportSettingsUi) -> u64 {
+    let (mut width, mut height) = sample.full_preview_image.dimensions();
+
+    if settings.enable_resize {
+        let max_dimension = settings.resize_value.max(1.0);
+        let (long_edge, short_edge) = if width >= height {
+            (width as f32, height as f32)
+        } else {
+            (height as f32, width as f32)
+        };
+
+        let resize_ratio = match settings.resize_mode {
+            ExportResizeMode::LongEdge => (max_dimension / long_edge).min(1.0),
+            ExportResizeMode::ShortEdge => (max_dimension / short_edge).min(1.0),
+            ExportResizeMode::Width => (max_dimension / width as f32).min(1.0),
+            ExportResizeMode::Height => (max_dimension / height as f32).min(1.0),
+        };
+
+        let ratio = if settings.dont_enlarge {
+            resize_ratio.min(1.0)
+        } else {
+            resize_ratio
+        };
+
+        width = ((width as f32 * ratio).round() as u32).max(1);
+        height = ((height as f32 * ratio).round() as u32).max(1);
+    }
+
+    let pixels = width as f64 * height as f64;
+
+    let bytes = match settings.file_format {
+        ExportFileFormat::Jpeg => pixels * (0.22 + (settings.jpeg_quality as f64 / 100.0) * 0.95),
+        ExportFileFormat::Png => pixels * 1.45,
+        ExportFileFormat::Tiff => pixels * 6.0,
+        ExportFileFormat::Webp => pixels * 0.18,
+    };
+
+    bytes.round() as u64
+}
+
+async fn export_images_task(
+    output_folder: PathBuf,
+    jobs: Vec<ExportJob>,
+    settings: ExportSettingsUi,
+    renderer: RapidRawRenderer,
+) -> Result<ExportOutcome, String> {
+    export_images(&output_folder, &jobs, &settings, &renderer)?;
+    Ok(ExportOutcome {
+        exported_count: jobs.len(),
+        output_folder,
+    })
+}
+
+fn export_images(
+    output_folder: &Path,
+    jobs: &[ExportJob],
+    settings: &ExportSettingsUi,
+    renderer: &RapidRawRenderer,
+) -> Result<(), String> {
+    fs::create_dir_all(output_folder).map_err(|error| {
+        format!(
+            "Failed to create export folder {}: {}",
+            output_folder.display(),
+            error
+        )
+    })?;
+
+    for job in jobs {
+        let source_image = load_full_resolution_image(&job.path, job.is_raw)?;
+        let rendered = renderer.render(&source_image, &job.adjustments, job.is_raw)?;
+        let resized = apply_export_resize(&rendered, settings);
+        let final_image = apply_export_watermark(resized, settings)?;
+        let output_path = make_export_output_path(output_folder, &job.path, settings.file_format);
+        save_export_image(&final_image, &output_path, settings)?;
+    }
+
+    Ok(())
+}
+
+fn load_full_resolution_image(path: &Path, is_raw: bool) -> Result<DynamicImage, String> {
+    if is_raw {
+        decode_raw_preview(path)
+    } else {
+        open_image(path).map_err(|error| format!("Failed to open {}: {}", path.display(), error))
+    }
+}
+
+fn apply_export_resize(image: &DynamicImage, settings: &ExportSettingsUi) -> DynamicImage {
+    if !settings.enable_resize {
+        return image.clone();
+    }
+
+    let (current_w, current_h) = image.dimensions();
+    let (target_w, target_h) = calculate_export_target(current_w, current_h, settings);
+    if target_w == current_w && target_h == current_h {
+        image.clone()
+    } else {
+        image.resize(target_w, target_h, FilterType::Lanczos3)
+    }
+}
+
+fn calculate_export_target(
+    current_w: u32,
+    current_h: u32,
+    settings: &ExportSettingsUi,
+) -> (u32, u32) {
+    let value = settings.resize_value.round().clamp(1.0, 8192.0) as u32;
+
+    if settings.dont_enlarge {
+        let exceeds = match settings.resize_mode {
+            ExportResizeMode::LongEdge => current_w.max(current_h) > value,
+            ExportResizeMode::ShortEdge => current_w.min(current_h) > value,
+            ExportResizeMode::Width => current_w > value,
+            ExportResizeMode::Height => current_h > value,
+        };
+        if !exceeds {
+            return (current_w, current_h);
+        }
+    }
+
+    let fix_width = match settings.resize_mode {
+        ExportResizeMode::LongEdge => current_w >= current_h,
+        ExportResizeMode::ShortEdge => current_w <= current_h,
+        ExportResizeMode::Width => true,
+        ExportResizeMode::Height => false,
+    };
+
+    if fix_width {
+        let target_h = (value as f32 * (current_h as f32 / current_w.max(1) as f32)).round() as u32;
+        (value.max(1), target_h.max(1))
+    } else {
+        let target_w = (value as f32 * (current_w as f32 / current_h.max(1) as f32)).round() as u32;
+        (target_w.max(1), value.max(1))
+    }
+}
+
+fn apply_export_watermark(
+    mut image: DynamicImage,
+    settings: &ExportSettingsUi,
+) -> Result<DynamicImage, String> {
+    if !settings.enable_watermark || settings.watermark_path.trim().is_empty() {
+        return Ok(image);
+    }
+
+    let watermark_image = open_image(Path::new(settings.watermark_path.trim())).map_err(|error| {
+        format!(
+            "Failed to open watermark image {}: {}",
+            settings.watermark_path.trim(),
+            error
+        )
+    })?;
+
+    let (base_w, base_h) = image.dimensions();
+    let base_min_dim = base_w.min(base_h) as f32;
+    let scale = (base_min_dim * (settings.watermark_scale / 100.0))
+        / watermark_image.width().max(1) as f32;
+    let target_w = (watermark_image.width() as f32 * scale).round() as u32;
+    let target_h = (watermark_image.height() as f32 * scale).round() as u32;
+
+    if target_w == 0 || target_h == 0 {
+        return Ok(image);
+    }
+
+    let resized = watermark_image.resize_exact(target_w, target_h, FilterType::Lanczos3);
+    let mut watermark_rgba = resized.to_rgba8();
+    let opacity = (settings.watermark_opacity / 100.0).clamp(0.0, 1.0);
+    for pixel in watermark_rgba.pixels_mut() {
+        pixel[3] = (pixel[3] as f32 * opacity).round().clamp(0.0, 255.0) as u8;
+    }
+
+    let watermark = DynamicImage::ImageRgba8(watermark_rgba);
+    let spacing = (base_min_dim * (settings.watermark_spacing / 100.0)).round() as i64;
+    let (wm_w, wm_h) = watermark.dimensions();
+
+    let x = match settings.watermark_anchor {
+        WatermarkAnchor::TopLeft | WatermarkAnchor::CenterLeft | WatermarkAnchor::BottomLeft => {
+            spacing
+        }
+        WatermarkAnchor::TopCenter | WatermarkAnchor::Center | WatermarkAnchor::BottomCenter => {
+            (base_w as i64 - wm_w as i64) / 2
+        }
+        WatermarkAnchor::TopRight | WatermarkAnchor::CenterRight | WatermarkAnchor::BottomRight => {
+            base_w as i64 - wm_w as i64 - spacing
+        }
+    };
+
+    let y = match settings.watermark_anchor {
+        WatermarkAnchor::TopLeft | WatermarkAnchor::TopCenter | WatermarkAnchor::TopRight => {
+            spacing
+        }
+        WatermarkAnchor::CenterLeft | WatermarkAnchor::Center | WatermarkAnchor::CenterRight => {
+            (base_h as i64 - wm_h as i64) / 2
+        }
+        WatermarkAnchor::BottomLeft
+        | WatermarkAnchor::BottomCenter
+        | WatermarkAnchor::BottomRight => base_h as i64 - wm_h as i64 - spacing,
+    };
+
+    ::image::imageops::overlay(&mut image, &watermark, x, y);
+    Ok(image)
+}
+
+fn make_export_output_path(
+    output_folder: &Path,
+    source_path: &Path,
+    format: ExportFileFormat,
+) -> PathBuf {
+    let stem = source_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("untitled");
+    let extension = export_extension(format);
+    let mut candidate = output_folder.join(format!("{stem}.{extension}"));
+    let mut suffix = 2;
+
+    while candidate.exists() {
+        candidate = output_folder.join(format!("{stem}-{suffix}.{extension}"));
+        suffix += 1;
+    }
+
+    candidate
+}
+
+fn export_extension(format: ExportFileFormat) -> &'static str {
+    match format {
+        ExportFileFormat::Jpeg => "jpg",
+        ExportFileFormat::Png => "png",
+        ExportFileFormat::Tiff => "tiff",
+        ExportFileFormat::Webp => "webp",
+    }
+}
+
+fn save_export_image(
+    image: &DynamicImage,
+    output_path: &Path,
+    settings: &ExportSettingsUi,
+) -> Result<(), String> {
+    let mut encoded = Vec::new();
+
+    match settings.file_format {
+        ExportFileFormat::Jpeg => {
+            let mut encoder = ::image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut encoded,
+                settings.jpeg_quality.round().clamp(1.0, 100.0) as u8,
+            );
+            encoder
+                .encode_image(image)
+                .map_err(|error| format!("Failed to encode JPEG: {}", error))?;
+        }
+        ExportFileFormat::Png => {
+            let mut cursor = std::io::Cursor::new(&mut encoded);
+            image
+                .write_to(&mut cursor, ::image::ImageFormat::Png)
+                .map_err(|error| format!("Failed to encode PNG: {}", error))?;
+        }
+        ExportFileFormat::Tiff => {
+            let mut cursor = std::io::Cursor::new(&mut encoded);
+            image
+                .write_to(&mut cursor, ::image::ImageFormat::Tiff)
+                .map_err(|error| format!("Failed to encode TIFF: {}", error))?;
+        }
+        ExportFileFormat::Webp => {
+            let mut cursor = std::io::Cursor::new(&mut encoded);
+            image
+                .write_to(&mut cursor, ::image::ImageFormat::WebP)
+                .map_err(|error| format!("Failed to encode WebP: {}", error))?;
+        }
+    }
+
+    fs::write(output_path, encoded)
+        .map_err(|error| format!("Failed to write {}: {}", output_path.display(), error))
+}
+
+fn format_estimated_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.1} GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.0} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn color_grading_zone_mut(
     settings: &mut ColorGradingSettingsUi,
     zone: ColorGradingZone,
@@ -3434,6 +4265,113 @@ where
             .on_release(Message::CommitPreviewRender),
     ]
     .spacing(6)
+    .into()
+}
+
+fn export_option_row<'a>(label: &'a str, control: Element<'a, Message>) -> Element<'a, Message> {
+    container(
+        column![
+        text(label)
+            .size(14)
+            .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+        control,
+    ]
+    .spacing(8),
+    )
+    .width(Length::Fill)
+    .into()
+}
+
+fn export_choice_button<'a>(label: &'a str, active: bool, message: Message) -> Element<'a, Message> {
+    button(
+        text(label)
+            .size(13)
+            .color(if active {
+                Color::WHITE
+            } else {
+                Color::from_rgb8(0xc2, 0xcb, 0xdd)
+            }),
+    )
+    .padding([8, 10])
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(if active {
+            Color::from_rgb8(0x24, 0x5d, 0x88)
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => Color::from_rgb8(0x2a, 0x33, 0x42),
+                _ => Color::from_rgb8(0x24, 0x2d, 0x3a),
+            }
+        }));
+        style.border.radius = 10.0.into();
+        style.text_color = Color::WHITE;
+        style
+    })
+    .on_press(message)
+    .into()
+}
+
+fn export_toggle_row<'a>(
+    label: &'a str,
+    _enabled: bool,
+    progress: f32,
+    message: Message,
+) -> Element<'a, Message> {
+    let progress = ease_in_out(progress);
+    let left_space = 16.0 * progress;
+    let right_space = 16.0 - left_space;
+    let thumb: Element<'a, Message> = container(Space::with_width(Length::Fixed(14.0)))
+        .width(Length::Fixed(14.0))
+        .height(Length::Fixed(14.0))
+        .style(|_| container::Style {
+            background: Some(Background::Color(Color::WHITE)),
+            border: Border::default().rounded(999.0),
+            ..container::Style::default()
+        })
+        .into();
+
+    let switch_row = row![
+        Space::with_width(Length::Fixed(left_space)),
+        thumb,
+        Space::with_width(Length::Fixed(right_space))
+    ]
+    .align_y(iced::alignment::Vertical::Center);
+
+    let track_color = lerp_color(
+        Color::from_rgb8(0x2a, 0x31, 0x3d),
+        Color::from_rgb8(0x24, 0x5d, 0x88),
+        progress,
+    );
+
+    button(
+        row![
+            text(label)
+                .size(14)
+                .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+            Space::with_width(Length::Fill),
+            container(switch_row)
+                .width(Length::Fixed(38.0))
+                .height(Length::Fixed(22.0))
+                .padding(4)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(track_color)),
+                    border: Border::default().rounded(999.0),
+                    ..container::Style::default()
+                }),
+        ]
+        .align_y(iced::alignment::Vertical::Center),
+    )
+    .width(Length::Fill)
+    .padding(0)
+    .style(|theme, status| {
+        let mut style = iced::widget::button::text(theme, status);
+        if matches!(status, iced::widget::button::Status::Hovered) {
+            style.background = Some(Background::Color(Color::from_rgb8(0x1d, 0x24, 0x31)));
+        }
+        style.border.radius = 10.0.into();
+        style
+    })
+    .on_press(message)
     .into()
 }
 
@@ -3806,6 +4744,7 @@ fn card_section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, M
         ]
         .spacing(10),
     )
+    .width(Length::Fill)
     .padding(12)
     .style(|_| container::Style {
         text_color: Some(Color::WHITE),
@@ -4014,6 +4953,33 @@ fn step_card_animation(card: &mut CardAnimation) {
 fn ease_in_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+fn step_export_toggle_animation(progress: &mut f32, enabled: bool) {
+    let target = bool_to_progress(enabled);
+    let step = 0.18;
+
+    if (target - *progress).abs() <= step {
+        *progress = target;
+    } else if target > *progress {
+        *progress = (*progress + step).clamp(0.0, 1.0);
+    } else {
+        *progress = (*progress - step).clamp(0.0, 1.0);
+    }
+}
+
+fn bool_to_progress(value: bool) -> f32 {
+    if value { 1.0 } else { 0.0 }
+}
+
+fn lerp_color(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: from.r + (to.r - from.r) * t,
+        g: from.g + (to.g - from.g) * t,
+        b: from.b + (to.b - from.b) * t,
+        a: from.a + (to.a - from.a) * t,
+    }
 }
 
 #[derive(Debug, Clone)]
