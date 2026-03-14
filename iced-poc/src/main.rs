@@ -1,27 +1,34 @@
 mod rapidraw_shader;
 
-use iced::widget::{
-    Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, tooltip,
+use ::image::{
+    DynamicImage, GenericImageView, RgbImage, RgbaImage, imageops::FilterType, open as open_image,
 };
-use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme, application, keyboard, mouse, window};
-use ::image::{DynamicImage, GenericImageView, RgbImage, imageops::FilterType, open as open_image};
+use iced::widget::{
+    Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack,
+    text, tooltip,
+};
+use iced::{
+    Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme,
+    application, keyboard, mouse, window,
+};
+use rapidraw_shader::{
+    BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint,
+    CurvesSettings, HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points,
+    parse_lut_metadata,
+};
 use rawler::{
     decoders::{Orientation, RawDecodeParams},
     imgop::develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
     rawsource::RawSource,
 };
-use rapidraw_shader::{
-    BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint, CurvesSettings,
-    HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points, parse_lut_metadata,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
-use std::time::Instant;
-use std::path::{Path, PathBuf};
 use std::panic::{self, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 fn main() -> iced::Result {
     application("RapidRAW Iced POC Preview", App::update, App::view)
@@ -42,6 +49,7 @@ enum Message {
     OpenFolder,
     FolderLoaded(Result<LoadedFolder, String>),
     SelectImage(usize),
+    NavigateSelection(i32),
     ModifiersChanged(iced::keyboard::Modifiers),
     UndoRequested,
     AnimationFrame(Instant),
@@ -78,6 +86,7 @@ enum Message {
     GrainAmountChanged(f32),
     GrainSizeChanged(f32),
     GrainRoughnessChanged(f32),
+    SetRating(u8),
     SelectLut,
     SelectLutFolder,
     LutFolderLoaded(Result<LutBrowserState, String>),
@@ -186,6 +195,7 @@ struct SampleImage {
     preview: image::Handle,
     thumbnail: image::Handle,
     is_raw: bool,
+    rating: u8,
     adjustments: BasicAdjustments,
     histogram: HistogramData,
 }
@@ -201,6 +211,17 @@ struct RenderedPreview {
     handle: image::Handle,
     changed: bool,
 }
+
+#[derive(Debug, Clone)]
+struct ThumbnailCanvas {
+    handle: image::Handle,
+    corner_radius: f32,
+}
+
+const FILMSTRIP_CARD_RADIUS: f32 = 14.0;
+const FILMSTRIP_CARD_PADDING: f32 = 6.0;
+const FILMSTRIP_IMAGE_RADIUS: f32 = 24.0;
+const FILMSTRIP_IMAGE_RADIUS_PX: u32 = FILMSTRIP_IMAGE_RADIUS as u32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageMetadata {
@@ -219,6 +240,49 @@ impl Default for ImageMetadata {
             adjustments: Value::Null,
             tags: None,
         }
+    }
+}
+
+impl<Message> canvas::Program<Message> for ThumbnailCanvas {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let background = canvas::Path::rounded_rectangle(
+            Point::ORIGIN,
+            bounds.size(),
+            self.corner_radius.into(),
+        );
+
+        frame.fill(&background, Color::from_rgb8(0x12, 0x16, 0x20));
+        frame.with_clip(
+            Rectangle {
+                x: 0.0,
+                y: 0.0,
+                width: bounds.width,
+                height: bounds.height,
+            },
+            |frame| {
+                frame.draw_image(
+                    Rectangle {
+                        x: 0.0,
+                        y: 0.0,
+                        width: bounds.width,
+                        height: bounds.height,
+                    },
+                    canvas::Image::new(self.handle.clone()),
+                );
+            },
+        );
+
+        vec![frame.into_geometry()]
     }
 }
 
@@ -365,11 +429,21 @@ impl App {
             {
                 Some(Message::UndoRequested)
             }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if !modifiers.command() && !modifiers.alt() && !modifiers.control() =>
+            {
+                rating_from_key(&key)
+                    .map(Message::SetRating)
+                    .or_else(|| arrow_navigation_message(&key))
+            }
             _ => None,
         });
 
         if self.is_animating_cards() {
-            Subscription::batch(vec![modifiers, window::frames().map(Message::AnimationFrame)])
+            Subscription::batch(vec![
+                modifiers,
+                window::frames().map(Message::AnimationFrame),
+            ])
         } else {
             modifiers
         }
@@ -398,7 +472,8 @@ impl App {
                 self.finish_pending_drag_undo();
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.is_loading = true;
-                    self.status_message = Some(format!("Loading images from {}...", path.display()));
+                    self.status_message =
+                        Some(format!("Loading images from {}...", path.display()));
                     return Task::perform(load_folder_task(path), Message::FolderLoaded);
                 }
             }
@@ -406,28 +481,31 @@ impl App {
                 self.is_loading = false;
                 match result {
                     Ok(folder) => {
-                    self.current_folder = Some(folder.path.clone());
-                    self.samples = folder.samples;
-                    self.selected_index = 0;
-                    self.selected_indices = if self.samples.is_empty() {
-                        BTreeSet::new()
-                    } else {
-                        BTreeSet::from([0])
-                    };
-                    self.rendered_preview = None;
-                    self.pending_preview_quality = None;
-                    self.basic_adjustments = self
-                        .samples
-                        .first()
-                        .map(|sample| sample.adjustments.clone())
-                        .unwrap_or_default();
+                        self.current_folder = Some(folder.path.clone());
+                        self.samples = folder.samples;
+                        self.selected_index = 0;
+                        self.selected_indices = if self.samples.is_empty() {
+                            BTreeSet::new()
+                        } else {
+                            BTreeSet::from([0])
+                        };
+                        self.rendered_preview = None;
+                        self.pending_preview_quality = None;
+                        self.basic_adjustments = self
+                            .samples
+                            .first()
+                            .map(|sample| sample.adjustments.clone())
+                            .unwrap_or_default();
                         self.route = if self.samples.is_empty() {
                             Route::Home
                         } else {
                             Route::Editor
                         };
                         self.status_message = if self.samples.is_empty() {
-                            Some("The selected folder did not contain any supported image files.".to_string())
+                            Some(
+                                "The selected folder did not contain any supported image files."
+                                    .to_string(),
+                            )
                         } else {
                             Some(format!(
                                 "Loaded {} image{} from {}",
@@ -454,10 +532,40 @@ impl App {
             Message::ModifiersChanged(modifiers) => {
                 self.shift_pressed = modifiers.shift();
             }
+            Message::SetRating(rating) => {
+                self.finish_pending_drag_undo();
+                let indices = if self.selected_indices.is_empty() {
+                    vec![self.selected_index]
+                } else {
+                    self.selected_indices.iter().copied().collect::<Vec<_>>()
+                };
+
+                for index in indices {
+                    if let Some(sample) = self.samples.get_mut(index) {
+                        sample.rating = rating;
+                        if let Err(error) = save_sample_adjustments(sample) {
+                            self.status_message = Some(error);
+                        }
+                    }
+                }
+
+                self.status_message = Some(if rating == 0 {
+                    "Cleared rating.".to_string()
+                } else {
+                    format!(
+                        "Set rating to {rating} star{}.",
+                        if rating == 1 { "" } else { "s" }
+                    )
+                });
+            }
             Message::UndoRequested => {
                 self.finish_pending_drag_undo();
                 if let Some(entry) = self.undo_stack.pop() {
-                    let indices = entry.changes.iter().map(|change| change.index).collect::<Vec<_>>();
+                    let indices = entry
+                        .changes
+                        .iter()
+                        .map(|change| change.index)
+                        .collect::<Vec<_>>();
                     for change in entry.changes {
                         if let Some(sample) = self.samples.get_mut(change.index) {
                             sample.adjustments = change.adjustments;
@@ -515,84 +623,134 @@ impl App {
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
+            Message::NavigateSelection(offset) => {
+                self.finish_pending_drag_undo();
+                if self.route == Route::Editor && !self.samples.is_empty() {
+                    let next_index = (self.selected_index as i32 + offset)
+                        .clamp(0, self.samples.len().saturating_sub(1) as i32)
+                        as usize;
+
+                    if next_index != self.selected_index {
+                        self.selected_indices.clear();
+                        self.selected_indices.insert(next_index);
+                        self.selected_index = next_index;
+                        self.rendered_preview = None;
+                        self.pending_preview_quality = None;
+                        self.basic_adjustments = self.samples[next_index].adjustments.clone();
+                        return self.request_preview_render(PreviewQuality::Full);
+                    }
+                }
+            }
             Message::ExposureChanged(value) => {
                 self.basic_adjustments.exposure = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.exposure = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.exposure = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::BrightnessChanged(value) => {
                 self.basic_adjustments.brightness = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.brightness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.brightness = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ContrastChanged(value) => {
                 self.basic_adjustments.contrast = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.contrast = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.contrast = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HighlightsChanged(value) => {
                 self.basic_adjustments.highlights = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.highlights = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.highlights = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ShadowsChanged(value) => {
                 self.basic_adjustments.shadows = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.shadows = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.shadows = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::WhitesChanged(value) => {
                 self.basic_adjustments.whites = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.whites = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.whites = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::BlacksChanged(value) => {
                 self.basic_adjustments.blacks = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.blacks = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.blacks = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::TemperatureChanged(value) => {
                 self.basic_adjustments.temperature = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.temperature = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.temperature = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::TintChanged(value) => {
                 self.basic_adjustments.tint = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.tint = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.tint = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VibranceChanged(value) => {
                 self.basic_adjustments.vibrance = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vibrance = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.vibrance = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SaturationChanged(value) => {
                 self.basic_adjustments.saturation = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.saturation = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.saturation = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SharpnessChanged(value) => {
                 self.basic_adjustments.sharpness = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.sharpness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.sharpness = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ClarityChanged(value) => {
                 self.basic_adjustments.clarity = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.clarity = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.clarity = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::DehazeChanged(value) => {
                 self.basic_adjustments.dehaze = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.dehaze = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.dehaze = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::StructureChanged(value) => {
                 self.basic_adjustments.structure = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.structure = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.structure = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::CentreChanged(value) => {
                 self.basic_adjustments.centre = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.centre = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.centre = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ChromaticAberrationRedCyanChanged(value) => {
@@ -611,57 +769,80 @@ impl App {
             }
             Message::GlowAmountChanged(value) => {
                 self.basic_adjustments.glow_amount = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.glow_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.glow_amount = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HalationAmountChanged(value) => {
                 self.basic_adjustments.halation_amount = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.halation_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.halation_amount = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::FlareAmountChanged(value) => {
                 self.basic_adjustments.flare_amount = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.flare_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.flare_amount = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteAmountChanged(value) => {
                 self.basic_adjustments.vignette_amount = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.vignette_amount = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteMidpointChanged(value) => {
                 self.basic_adjustments.vignette_midpoint = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_midpoint = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.vignette_midpoint = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteRoundnessChanged(value) => {
                 self.basic_adjustments.vignette_roundness = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_roundness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.vignette_roundness = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteFeatherChanged(value) => {
                 self.basic_adjustments.vignette_feather = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_feather = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.vignette_feather = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainAmountChanged(value) => {
                 self.basic_adjustments.grain_amount = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.grain_amount = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainSizeChanged(value) => {
                 self.basic_adjustments.grain_size = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_size = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.grain_size = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainRoughnessChanged(value) => {
                 self.basic_adjustments.grain_roughness = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_roughness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.grain_roughness = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SelectLut => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("LUT Files", &["cube", "3dl", "png", "jpg", "jpeg", "tiff", "tif"])
+                    .add_filter(
+                        "LUT Files",
+                        &["cube", "3dl", "png", "jpg", "jpeg", "tiff", "tif"],
+                    )
                     .pick_file()
                 {
                     match parse_lut_metadata(&path) {
@@ -675,12 +856,16 @@ impl App {
                             self.basic_adjustments.lut_path = Some(lut_path.clone());
                             self.basic_adjustments.lut_name = Some(lut_name.clone());
                             self.basic_adjustments.lut_size = lut_size;
-                            self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
-                                adjustments.lut_path = Some(lut_path.clone());
-                                adjustments.lut_name = Some(lut_name.clone());
-                                adjustments.lut_size = lut_size;
-                            });
-                            self.status_message = Some(format!("Loaded LUT {} ({lut_size}^3).", lut_name));
+                            self.update_selected_adjustments(
+                                UndoBehavior::Immediate,
+                                |adjustments| {
+                                    adjustments.lut_path = Some(lut_path.clone());
+                                    adjustments.lut_name = Some(lut_name.clone());
+                                    adjustments.lut_size = lut_size;
+                                },
+                            );
+                            self.status_message =
+                                Some(format!("Loaded LUT {} ({lut_size}^3).", lut_name));
                             return self.request_preview_render(PreviewQuality::Full);
                         }
                         Err(error) => {
@@ -730,7 +915,9 @@ impl App {
             }
             Message::LutIntensityChanged(value) => {
                 self.basic_adjustments.lut_intensity = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.lut_intensity = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.lut_intensity = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HoverLut(index) => {
@@ -747,7 +934,8 @@ impl App {
             Message::ApplyLutFromBrowser(index) => {
                 if let Some(entry) = self.lut_browser.entries.get(index).cloned() {
                     let lut_path = entry.path.to_string_lossy().to_string();
-                    let already_selected = self.basic_adjustments.lut_path.as_deref() == Some(lut_path.as_str());
+                    let already_selected =
+                        self.basic_adjustments.lut_path.as_deref() == Some(lut_path.as_str());
                     if already_selected {
                         self.lut_browser.collapsed = !self.lut_browser.collapsed;
                         self.lut_browser.hovered_index = None;
@@ -769,7 +957,9 @@ impl App {
             }
             Message::ToneMapperChanged(value) => {
                 self.basic_adjustments.tone_mapper = value;
-                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| adjustments.tone_mapper = value);
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.tone_mapper = value
+                });
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::ActiveCurveChannelChanged(channel) => {
@@ -790,7 +980,9 @@ impl App {
             }
             Message::ResetBasicAdjustments => {
                 self.basic_adjustments = BasicAdjustments::default();
-                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| *adjustments = BasicAdjustments::default());
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    *adjustments = BasicAdjustments::default()
+                });
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
                 }
@@ -800,9 +992,17 @@ impl App {
             }
             Message::HslHueChanged(value) => {
                 let band = self.active_hsl_band;
-                set_hsl_value(hsl_band_mut(&mut self.basic_adjustments.hsl, band), HslField::Hue, value);
+                set_hsl_value(
+                    hsl_band_mut(&mut self.basic_adjustments.hsl, band),
+                    HslField::Hue,
+                    value,
+                );
                 self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
-                    set_hsl_value(hsl_band_mut(&mut adjustments.hsl, band), HslField::Hue, value);
+                    set_hsl_value(
+                        hsl_band_mut(&mut adjustments.hsl, band),
+                        HslField::Hue,
+                        value,
+                    );
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
@@ -848,7 +1048,8 @@ impl App {
             }
             Message::ColorGradingZoneLuminanceChanged(zone, value) => {
                 self.active_color_grading_zone = zone;
-                color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone).luminance = value;
+                color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone).luminance =
+                    value;
                 self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     color_grading_zone_mut(&mut adjustments.color_grading, zone).luminance = value;
                 });
@@ -856,12 +1057,16 @@ impl App {
             }
             Message::ColorGradingBlendingChanged(value) => {
                 self.basic_adjustments.color_grading.blending = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.color_grading.blending = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.color_grading.blending = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ColorGradingBalanceChanged(value) => {
                 self.basic_adjustments.color_grading.balance = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.color_grading.balance = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.color_grading.balance = value
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ResetColorAdjustments => {
@@ -950,12 +1155,32 @@ impl App {
                         Ok(rendered) => {
                             self.rendered_preview = Some(rendered.handle.clone());
                             if let Some(sample) = self.samples.get_mut(self.selected_index) {
-                                sample.thumbnail = rendered.handle.clone();
+                                if let image::Handle::Rgba {
+                                    width,
+                                    height,
+                                    pixels,
+                                    ..
+                                } = &rendered.handle
+                                {
+                                    if let Some(rgba) = ::image::RgbaImage::from_raw(
+                                        *width,
+                                        *height,
+                                        pixels.to_vec(),
+                                    ) {
+                                        let image = DynamicImage::ImageRgba8(rgba);
+                                        let thumbnail = resize_for_bound(&image, 320);
+                                        sample.thumbnail = make_rounded_thumbnail_handle(
+                                            &thumbnail,
+                                            FILMSTRIP_IMAGE_RADIUS_PX,
+                                        );
+                                    }
+                                }
                             }
                             self.status_message = Some(if rendered.changed {
                                 "Preview updated.".to_string()
                             } else {
-                                "Preview render completed, but the pixels were unchanged.".to_string()
+                                "Preview render completed, but the pixels were unchanged."
+                                    .to_string()
                             });
                         }
                         Err(error) => {
@@ -984,10 +1209,16 @@ impl App {
 
     fn is_animating_cards(&self) -> bool {
         (self.basic_card.progress - if self.basic_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
-            || (self.curves_card.progress - if self.curves_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
-            || (self.color_card.progress - if self.color_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
-            || (self.details_card.progress - if self.details_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
-            || (self.effects_card.progress - if self.effects_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
+            || (self.curves_card.progress - if self.curves_card.expanded { 1.0 } else { 0.0 }).abs()
+                > 0.01
+            || (self.color_card.progress - if self.color_card.expanded { 1.0 } else { 0.0 }).abs()
+                > 0.01
+            || (self.details_card.progress - if self.details_card.expanded { 1.0 } else { 0.0 })
+                .abs()
+                > 0.01
+            || (self.effects_card.progress - if self.effects_card.expanded { 1.0 } else { 0.0 })
+                .abs()
+                > 0.01
     }
 
     fn update_selected_adjustments(
@@ -1025,10 +1256,14 @@ impl App {
 
         if !undo_changes.is_empty() {
             match undo_behavior {
-                UndoBehavior::Immediate => self.push_undo_entry(UndoEntry { changes: undo_changes }),
+                UndoBehavior::Immediate => self.push_undo_entry(UndoEntry {
+                    changes: undo_changes,
+                }),
                 UndoBehavior::Coalesced => {
                     if self.pending_drag_undo.is_none() {
-                        self.pending_drag_undo = Some(UndoEntry { changes: undo_changes });
+                        self.pending_drag_undo = Some(UndoEntry {
+                            changes: undo_changes,
+                        });
                     }
                 }
             }
@@ -1167,12 +1402,9 @@ impl App {
                 text(selected.path.display().to_string())
                     .size(14)
                     .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
-                text(format!(
-                    "{} selected",
-                    self.selected_indices.len().max(1)
-                ))
-                .size(13)
-                .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
+                text(format!("{} selected", self.selected_indices.len().max(1)))
+                    .size(13)
+                    .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
                 if self.is_rendering_preview {
                     text("Rendering preview...")
                         .size(13)
@@ -1189,10 +1421,14 @@ impl App {
         .spacing(10);
 
         let preview = container(
-            image(self.rendered_preview.clone().unwrap_or_else(|| selected.preview.clone()))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(iced::ContentFit::Contain),
+            image(
+                self.rendered_preview
+                    .clone()
+                    .unwrap_or_else(|| selected.preview.clone()),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .content_fit(iced::ContentFit::Contain),
         )
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1203,24 +1439,32 @@ impl App {
             .samples
             .iter()
             .enumerate()
-            .fold(row![].spacing(16).width(Length::Fill), |row, (index, sample)| {
+            .fold(row![].spacing(16), |row, (index, sample)| {
                 row.push(self.filmstrip_item(index, sample))
             });
 
         let filmstrip = container(
-            scrollable(
-                container(filmstrip_items)
-                    .padding([10, 4])
-                    .width(Length::Fill),
+            container(
+                scrollable(
+                    container(filmstrip_items)
+                        .padding([8, 6])
+                        .width(Length::Shrink),
+                )
+                .width(Length::Fill)
+                .direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new()
+                        .width(4)
+                        .margin(1)
+                        .scroller_width(4),
+                ))
+                .style(discrete_scrollbar_style),
             )
+            .clip(true)
             .width(Length::Fill)
-            .direction(scrollable::Direction::Horizontal(
-                scrollable::Scrollbar::default(),
-            )),
+            .height(Length::Fill),
         )
         .width(Length::Fill)
-        .height(Length::Fixed(178.0))
-        .padding([10, 12])
+        .height(Length::Fixed(128.0))
         .style(panel_style);
 
         let editor_body = row![
@@ -1258,9 +1502,15 @@ impl App {
                     .content_fit(iced::ContentFit::Cover),
                 Space::with_height(Length::Fixed(12.0)),
                 text(&sample.name).size(20),
-                text(sample.path.file_name().and_then(|name| name.to_str()).unwrap_or_default())
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                text(
+                    sample
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                )
+                .size(14)
+                .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
             ]
             .spacing(2),
         )
@@ -1277,38 +1527,92 @@ impl App {
     fn filmstrip_item<'a>(&'a self, index: usize, sample: &'a SampleImage) -> Element<'a, Message> {
         let is_active = index == self.selected_index;
         let is_selected = self.selected_indices.contains(&index);
-        let background = if is_active {
-            Color::from_rgb8(0x27, 0x35, 0x49)
-        } else if is_selected {
-            Color::from_rgb8(0x1d, 0x29, 0x38)
+        let background = if is_active || is_selected {
+            Color::from_rgb8(0x1a, 0x20, 0x2b)
         } else {
             Color::from_rgb8(0x16, 0x1b, 0x25)
         };
+        let (width, height) = sample.full_preview_image.dimensions();
+        let thumb_height = 92.0;
+        let thumb_width = if height == 0 {
+            thumb_height
+        } else {
+            ((width as f32 / height as f32) * thumb_height)
+                .max(54.0)
+                .min(220.0)
+        };
 
-        let card = container(
-            column![
-                image(sample.thumbnail.clone())
-                    .width(Length::Fixed(148.0))
-                    .height(Length::Fixed(92.0))
-                    .content_fit(iced::ContentFit::Cover),
-                Space::with_height(Length::Fixed(8.0)),
-                text(&sample.name).size(15),
-            ]
-            .spacing(0),
+        let image_frame = canvas::Canvas::new(ThumbnailCanvas {
+            handle: sample.thumbnail.clone(),
+            corner_radius: FILMSTRIP_IMAGE_RADIUS,
+        })
+        .width(Length::Fixed(thumb_width))
+        .height(Length::Fixed(thumb_height));
+
+        let card = container(image_frame)
+            .padding(FILMSTRIP_CARD_PADDING)
+            .clip(true)
+            .style(move |_| container::Style {
+                text_color: Some(Color::WHITE),
+                background: Some(Background::Color(background)),
+                border: Border {
+                    color: if is_active || is_selected {
+                        Color::WHITE
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: if is_active || is_selected { 1.5 } else { 0.0 },
+                    radius: FILMSTRIP_CARD_RADIUS.into(),
+                },
+                ..container::Style::default()
+            });
+
+        let content: Element<'a, Message> = if sample.rating > 0 {
+            let base: Element<'a, Message> = card.into();
+            let badge: Element<'a, Message> = container(
+                row![
+                    text("★").size(11).color(Color::from_rgb8(0xf8, 0xe1, 0x6c)),
+                    text(sample.rating.to_string()).size(11).color(Color::WHITE),
+                ]
+                .spacing(4)
+                .align_y(iced::alignment::Vertical::Center),
+            )
+            .padding([4, 8])
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Top)
+            .into();
+
+            stack![base, badge].into()
+        } else {
+            card.into()
+        };
+
+        let file_name = sample
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&sample.name);
+
+        tooltip(
+            mouse_area(content)
+                .on_press(Message::SelectImage(index))
+                .interaction(iced::mouse::Interaction::Pointer),
+            container(
+                text(file_name)
+                    .size(12)
+                    .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
+            )
+            .padding([6, 10])
+            .style(|_| container::Style {
+                text_color: Some(Color::WHITE),
+                background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+                border: Border::default().rounded(10.0),
+                ..container::Style::default()
+            }),
+            tooltip::Position::Top,
         )
-        .padding(10)
-        .width(Length::Fixed(170.0))
-        .style(move |_| container::Style {
-            text_color: Some(Color::WHITE),
-            background: Some(Background::Color(background)),
-            border: iced::Border::default().rounded(14.0),
-            ..container::Style::default()
-        });
-
-        mouse_area(card)
-            .on_press(Message::SelectImage(index))
-            .interaction(iced::mouse::Interaction::Pointer)
-            .into()
+        .gap(8)
+        .into()
     }
 
     fn view_basic_panel(&self) -> Element<'_, Message> {
@@ -1318,7 +1622,11 @@ impl App {
                     .size(14)
                     .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
-                icon_button("↺", Message::ResetBasicAdjustments, "Reset basic adjustments"),
+                icon_button(
+                    "↺",
+                    Message::ResetBasicAdjustments,
+                    "Reset basic adjustments"
+                ),
             ]
             .align_y(iced::alignment::Vertical::Center),
             text(if self.selected_indices.len() > 1 {
@@ -1329,27 +1637,76 @@ impl App {
             .size(13)
             .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
             column![
-                text("Tone Mapper").size(14).color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                text("Tone Mapper")
+                    .size(14)
+                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 row![
-                    tone_mapper_button("Basic", ToneMapper::Basic, self.basic_adjustments.tone_mapper),
+                    tone_mapper_button(
+                        "Basic",
+                        ToneMapper::Basic,
+                        self.basic_adjustments.tone_mapper
+                    ),
                     tone_mapper_button("AgX", ToneMapper::AgX, self.basic_adjustments.tone_mapper),
                 ]
                 .spacing(8),
             ]
             .spacing(8),
-            basic_slider("Exposure", -5.0, 5.0, self.basic_adjustments.exposure, Message::ExposureChanged),
-            basic_slider("Brightness", -5.0, 5.0, self.basic_adjustments.brightness, Message::BrightnessChanged),
-            basic_slider("Contrast", -100.0, 100.0, self.basic_adjustments.contrast, Message::ContrastChanged),
-            basic_slider("Highlights", -100.0, 100.0, self.basic_adjustments.highlights, Message::HighlightsChanged),
-            basic_slider("Shadows", -100.0, 100.0, self.basic_adjustments.shadows, Message::ShadowsChanged),
-            basic_slider("Whites", -100.0, 100.0, self.basic_adjustments.whites, Message::WhitesChanged),
-            basic_slider("Blacks", -100.0, 100.0, self.basic_adjustments.blacks, Message::BlacksChanged),
+            basic_slider(
+                "Exposure",
+                -5.0,
+                5.0,
+                self.basic_adjustments.exposure,
+                Message::ExposureChanged
+            ),
+            basic_slider(
+                "Brightness",
+                -5.0,
+                5.0,
+                self.basic_adjustments.brightness,
+                Message::BrightnessChanged
+            ),
+            basic_slider(
+                "Contrast",
+                -100.0,
+                100.0,
+                self.basic_adjustments.contrast,
+                Message::ContrastChanged
+            ),
+            basic_slider(
+                "Highlights",
+                -100.0,
+                100.0,
+                self.basic_adjustments.highlights,
+                Message::HighlightsChanged
+            ),
+            basic_slider(
+                "Shadows",
+                -100.0,
+                100.0,
+                self.basic_adjustments.shadows,
+                Message::ShadowsChanged
+            ),
+            basic_slider(
+                "Whites",
+                -100.0,
+                100.0,
+                self.basic_adjustments.whites,
+                Message::WhitesChanged
+            ),
+            basic_slider(
+                "Blacks",
+                -100.0,
+                100.0,
+                self.basic_adjustments.blacks,
+                Message::BlacksChanged
+            ),
         ]
         .spacing(14);
 
         let selected = self.samples.get(self.selected_index);
         let curves_body: Element<'_, Message> = if let Some(sample) = selected {
-            let active_curve = curve_points(&self.basic_adjustments.curves, self.active_curve_channel);
+            let active_curve =
+                curve_points(&self.basic_adjustments.curves, self.active_curve_channel);
             let histogram = histogram_bins(&sample.histogram, self.active_curve_channel);
             let curve_editor = canvas::Canvas::new(CurveEditor {
                 channel: self.active_curve_channel,
@@ -1366,7 +1723,11 @@ impl App {
                         .size(14)
                         .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                     Space::with_width(Length::Fill),
-                    icon_button("↺", Message::ResetCurveChannel(self.active_curve_channel), "Reset curve channel"),
+                    icon_button(
+                        "↺",
+                        Message::ResetCurveChannel(self.active_curve_channel),
+                        "Reset curve channel"
+                    ),
                 ]
                 .align_y(iced::alignment::Vertical::Center),
                 row![
@@ -1391,7 +1752,11 @@ impl App {
                     .size(14)
                     .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
-                icon_button("↺", Message::ResetColorAdjustments, "Reset color adjustments"),
+                icon_button(
+                    "↺",
+                    Message::ResetColorAdjustments,
+                    "Reset color adjustments"
+                ),
             ]
             .align_y(iced::alignment::Vertical::Center),
             card_section(
@@ -1404,7 +1769,13 @@ impl App {
                         self.basic_adjustments.temperature,
                         Message::TemperatureChanged,
                     ),
-                    basic_slider("Tint", -100.0, 100.0, self.basic_adjustments.tint, Message::TintChanged),
+                    basic_slider(
+                        "Tint",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.tint,
+                        Message::TintChanged
+                    ),
                 ]
                 .spacing(12)
                 .into(),
@@ -1487,7 +1858,13 @@ impl App {
                     ]
                     .spacing(0)
                     .width(Length::Fill),
-                    basic_slider("Hue", -100.0, 100.0, current_hsl.hue, Message::HslHueChanged),
+                    basic_slider(
+                        "Hue",
+                        -100.0,
+                        100.0,
+                        current_hsl.hue,
+                        Message::HslHueChanged
+                    ),
                     basic_slider(
                         "Saturation",
                         -100.0,
@@ -1515,7 +1892,11 @@ impl App {
                     .size(14)
                     .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
-                icon_button("↺", Message::ResetDetailsAdjustments, "Reset details adjustments"),
+                icon_button(
+                    "↺",
+                    Message::ResetDetailsAdjustments,
+                    "Reset details adjustments"
+                ),
             ]
             .align_y(iced::alignment::Vertical::Center),
             card_section(
@@ -1595,7 +1976,11 @@ impl App {
                     .size(14)
                     .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
-                icon_button("↺", Message::ResetEffectsAdjustments, "Reset effects adjustments"),
+                icon_button(
+                    "↺",
+                    Message::ResetEffectsAdjustments,
+                    "Reset effects adjustments"
+                ),
             ]
             .align_y(iced::alignment::Vertical::Center),
             card_section(
@@ -1649,8 +2034,7 @@ impl App {
                     if let Some(lut_name) = &self.basic_adjustments.lut_name {
                         muted_line(format!(
                             "{} • {}^3",
-                            lut_name,
-                            self.basic_adjustments.lut_size
+                            lut_name, self.basic_adjustments.lut_size
                         ))
                     } else {
                         muted_line("Load a .cube, .3dl, or HALD image LUT.")
@@ -1667,7 +2051,10 @@ impl App {
                         Space::with_height(Length::Shrink).into()
                     },
                     if self.lut_browser.folder.is_some() {
-                        lut_browser_list(&self.lut_browser, self.basic_adjustments.lut_path.as_deref())
+                        lut_browser_list(
+                            &self.lut_browser,
+                            self.basic_adjustments.lut_path.as_deref(),
+                        )
                     } else {
                         Space::with_height(Length::Shrink).into()
                     },
@@ -1742,22 +2129,61 @@ impl App {
         .spacing(14);
 
         let controls = column![
-            adjustment_card("Basic", self.basic_card, Message::ToggleBasicCard, basic_body.into(), 430.0),
-            adjustment_card("Curves", self.curves_card, Message::ToggleCurvesCard, curves_body, 320.0),
-            adjustment_card("Color", self.color_card, Message::ToggleColorCard, color_body.into(), 1180.0),
-            adjustment_card("Details", self.details_card, Message::ToggleDetailsCard, details_body.into(), 620.0),
-            adjustment_card("Effects", self.effects_card, Message::ToggleEffectsCard, effects_body.into(), 700.0),
+            adjustment_card(
+                "Basic",
+                self.basic_card,
+                Message::ToggleBasicCard,
+                basic_body.into(),
+                430.0
+            ),
+            adjustment_card(
+                "Curves",
+                self.curves_card,
+                Message::ToggleCurvesCard,
+                curves_body,
+                320.0
+            ),
+            adjustment_card(
+                "Color",
+                self.color_card,
+                Message::ToggleColorCard,
+                color_body.into(),
+                1180.0
+            ),
+            adjustment_card(
+                "Details",
+                self.details_card,
+                Message::ToggleDetailsCard,
+                details_body.into(),
+                620.0
+            ),
+            adjustment_card(
+                "Effects",
+                self.effects_card,
+                Message::ToggleEffectsCard,
+                effects_body.into(),
+                700.0
+            ),
             text("Preview updates live for the selected image.")
                 .size(13)
                 .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
         ]
         .spacing(16);
 
-        container(scrollable(controls))
-            .padding(20)
-            .height(Length::Fill)
-            .style(panel_style)
-            .into()
+        container(
+            scrollable(controls)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new()
+                        .width(4)
+                        .margin(1)
+                        .scroller_width(4),
+                ))
+                .style(discrete_scrollbar_style),
+        )
+        .padding(20)
+        .height(Length::Fill)
+        .style(panel_style)
+        .into()
     }
 
     fn request_preview_render(&mut self, quality: PreviewQuality) -> Task<Message> {
@@ -1872,7 +2298,7 @@ impl App {
                     let rendered = renderer.render(base_image.as_ref(), &adjustments, is_raw);
                     let result = rendered.map(|image| {
                         let thumbnail = resize_for_bound(&image, 320);
-                        make_rgba_handle(&thumbnail)
+                        make_rounded_thumbnail_handle(&thumbnail, FILMSTRIP_IMAGE_RADIUS_PX)
                     });
                     results.push((index, result));
                 }
@@ -1985,6 +2411,7 @@ fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
         .unwrap_or("Untitled")
         .replace(['-', '_'], " ");
     let adjustments = load_sample_adjustments(&path).unwrap_or_default();
+    let rating = load_sample_rating(&path).unwrap_or(0);
 
     Ok(SampleImage {
         name: title_case(&name),
@@ -1994,6 +2421,7 @@ fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
         preview,
         thumbnail,
         is_raw,
+        rating,
         adjustments,
         histogram,
     })
@@ -2001,7 +2429,15 @@ fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
 
 fn load_preview_handles(
     path: &Path,
-) -> Result<(Arc<DynamicImage>, Arc<DynamicImage>, image::Handle, image::Handle), String> {
+) -> Result<
+    (
+        Arc<DynamicImage>,
+        Arc<DynamicImage>,
+        image::Handle,
+        image::Handle,
+    ),
+    String,
+> {
     let image = if is_supported_raw(path) {
         decode_raw_preview(path)?
     } else {
@@ -2011,7 +2447,10 @@ fn load_preview_handles(
     let full_preview_image = resize_for_bound(&image, 1800);
     let interactive_preview_image = resize_for_bound(&full_preview_image, 1100);
     let preview = make_rgba_handle(&full_preview_image);
-    let thumbnail = make_rgba_handle(&resize_for_bound(&full_preview_image, 320));
+    let thumbnail = make_rounded_thumbnail_handle(
+        &resize_for_bound(&full_preview_image, 320),
+        FILMSTRIP_IMAGE_RADIUS_PX,
+    );
 
     Ok((
         Arc::new(interactive_preview_image),
@@ -2023,6 +2462,43 @@ fn load_preview_handles(
 
 fn make_rgba_handle(image: &DynamicImage) -> image::Handle {
     let rgba = image.to_rgba8();
+    image::Handle::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
+}
+
+fn make_rounded_thumbnail_handle(image: &DynamicImage, radius: u32) -> image::Handle {
+    let mut rgba: RgbaImage = image.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let radius = radius.min(width / 2).min(height / 2) as f32;
+
+    if radius > 0.0 {
+        for y in 0..height {
+            for x in 0..width {
+                let cx = if x < radius as u32 {
+                    radius - 0.5
+                } else if x >= width.saturating_sub(radius as u32) {
+                    width as f32 - radius - 0.5
+                } else {
+                    continue;
+                };
+
+                let cy = if y < radius as u32 {
+                    radius - 0.5
+                } else if y >= height.saturating_sub(radius as u32) {
+                    height as f32 - radius - 0.5
+                } else {
+                    continue;
+                };
+
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                if dx * dx + dy * dy > radius * radius {
+                    rgba.get_pixel_mut(x, y).0[3] = 0;
+                }
+            }
+        }
+    }
+
     image::Handle::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
 }
 
@@ -2174,6 +2650,35 @@ fn matches_undo_key(key: &keyboard::Key) -> bool {
     }
 }
 
+fn arrow_navigation_message(key: &keyboard::Key) -> Option<Message> {
+    match key.as_ref() {
+        keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+            Some(Message::NavigateSelection(-1))
+        }
+        keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+            Some(Message::NavigateSelection(1))
+        }
+        _ => None,
+    }
+}
+
+fn rating_from_key(key: &keyboard::Key) -> Option<u8> {
+    match key.as_ref() {
+        keyboard::Key::Character(character) if character.len() == 1 => {
+            match character.chars().next()? {
+                '0' => Some(0),
+                '1' => Some(1),
+                '2' => Some(2),
+                '3' => Some(3),
+                '4' => Some(4),
+                '5' => Some(5),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn sidecar_path_for_image(path: &Path) -> PathBuf {
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     path.with_file_name(format!("{file_name}.rrdata"))
@@ -2193,6 +2698,20 @@ fn load_sample_adjustments(path: &Path) -> Result<BasicAdjustments, String> {
     Ok(adjustments_from_value(&metadata.adjustments))
 }
 
+fn load_sample_rating(path: &Path) -> Result<u8, String> {
+    let sidecar_path = sidecar_path_for_image(path);
+    if !sidecar_path.exists() {
+        return Ok(0);
+    }
+
+    let content = fs::read_to_string(&sidecar_path)
+        .map_err(|error| format!("Failed to read {}: {}", sidecar_path.display(), error))?;
+    let metadata: ImageMetadata = serde_json::from_str(&content)
+        .map_err(|error| format!("Failed to parse {}: {}", sidecar_path.display(), error))?;
+
+    Ok(metadata.rating.min(5))
+}
+
 fn save_sample_adjustments(sample: &SampleImage) -> Result<(), String> {
     let sidecar_path = sidecar_path_for_image(&sample.path);
     let mut metadata = if sidecar_path.exists() {
@@ -2204,6 +2723,7 @@ fn save_sample_adjustments(sample: &SampleImage) -> Result<(), String> {
         ImageMetadata::default()
     };
 
+    metadata.rating = sample.rating.min(5);
     merge_basic_adjustments(&mut metadata.adjustments, &sample.adjustments);
 
     let json_string = serde_json::to_string_pretty(&metadata)
@@ -2230,17 +2750,32 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
 
     BasicAdjustments {
         exposure: value.get("exposure").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        brightness: value.get("brightness").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        brightness: value
+            .get("brightness")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         contrast: value.get("contrast").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        highlights: value.get("highlights").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        highlights: value
+            .get("highlights")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         shadows: value.get("shadows").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         whites: value.get("whites").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         blacks: value.get("blacks").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        saturation: value.get("saturation").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        temperature: value.get("temperature").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        saturation: value
+            .get("saturation")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        temperature: value
+            .get("temperature")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         tint: value.get("tint").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         vibrance: value.get("vibrance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        sharpness: value.get("sharpness").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        sharpness: value
+            .get("sharpness")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         luma_noise_reduction: value
             .get("lumaNoiseReduction")
             .and_then(Value::as_f64)
@@ -2251,7 +2786,10 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
             .unwrap_or(0.0) as f32,
         clarity: value.get("clarity").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         dehaze: value.get("dehaze").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        structure: value.get("structure").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        structure: value
+            .get("structure")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         centre: value.get("centré").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         chromatic_aberration_red_cyan: value
             .get("chromaticAberrationRedCyan")
@@ -2261,7 +2799,10 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
             .get("chromaticAberrationBlueYellow")
             .and_then(Value::as_f64)
             .unwrap_or(0.0) as f32,
-        vignette_amount: value.get("vignetteAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        vignette_amount: value
+            .get("vignetteAmount")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         vignette_midpoint: value
             .get("vignetteMidpoint")
             .and_then(Value::as_f64)
@@ -2274,20 +2815,38 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
             .get("vignetteFeather")
             .and_then(Value::as_f64)
             .unwrap_or(50.0) as f32,
-        grain_amount: value.get("grainAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        grain_size: value.get("grainSize").and_then(Value::as_f64).unwrap_or(25.0) as f32,
+        grain_amount: value
+            .get("grainAmount")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        grain_size: value
+            .get("grainSize")
+            .and_then(Value::as_f64)
+            .unwrap_or(25.0) as f32,
         grain_roughness: value
             .get("grainRoughness")
             .and_then(Value::as_f64)
             .unwrap_or(50.0) as f32,
-        glow_amount: value.get("glowAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        glow_amount: value
+            .get("glowAmount")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         halation_amount: value
             .get("halationAmount")
             .and_then(Value::as_f64)
             .unwrap_or(0.0) as f32,
-        flare_amount: value.get("flareAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        lut_path: value.get("lutPath").and_then(Value::as_str).map(ToOwned::to_owned),
-        lut_name: value.get("lutName").and_then(Value::as_str).map(ToOwned::to_owned),
+        flare_amount: value
+            .get("flareAmount")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        lut_path: value
+            .get("lutPath")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        lut_name: value
+            .get("lutName")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         lut_size: value.get("lutSize").and_then(Value::as_u64).unwrap_or(0) as u32,
         lut_intensity: value
             .get("lutIntensity")
@@ -2389,14 +2948,20 @@ fn color_grading_from_value(value: &Value) -> ColorGradingSettingsUi {
         shadows: hue_sat_lum_from_value(value.get("shadows").unwrap_or(&Value::Null)),
         midtones: hue_sat_lum_from_value(value.get("midtones").unwrap_or(&Value::Null)),
         highlights: hue_sat_lum_from_value(value.get("highlights").unwrap_or(&Value::Null)),
-        blending: value.get("blending").and_then(Value::as_f64).unwrap_or(50.0) as f32,
+        blending: value
+            .get("blending")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0) as f32,
         balance: value.get("balance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
     }
 }
 
 fn color_calibration_from_value(value: &Value) -> ColorCalibrationSettingsUi {
     ColorCalibrationSettingsUi {
-        shadows_tint: value.get("shadowsTint").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        shadows_tint: value
+            .get("shadowsTint")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         red_hue: value.get("redHue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         red_saturation: value
             .get("redSaturation")
@@ -2418,8 +2983,14 @@ fn color_calibration_from_value(value: &Value) -> ColorCalibrationSettingsUi {
 fn hue_sat_lum_from_value(value: &Value) -> HueSatLum {
     HueSatLum {
         hue: value.get("hue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        saturation: value.get("saturation").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-        luminance: value.get("luminance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        saturation: value
+            .get("saturation")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        luminance: value
+            .get("luminance")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
     }
 }
 
@@ -2694,6 +3265,30 @@ fn panel_style(_theme: &Theme) -> container::Style {
     }
 }
 
+fn discrete_scrollbar_style(_theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let scroller_color = match status {
+        scrollable::Status::Active => Color::from_rgba8(0xff, 0xff, 0xff, 0.18),
+        scrollable::Status::Hovered { .. } => Color::from_rgba8(0xff, 0xff, 0xff, 0.28),
+        scrollable::Status::Dragged { .. } => Color::from_rgba8(0xff, 0xff, 0xff, 0.38),
+    };
+
+    let rail = scrollable::Rail {
+        background: Some(Background::Color(Color::from_rgba8(0xff, 0xff, 0xff, 0.05))),
+        border: Border::default().rounded(999.0),
+        scroller: scrollable::Scroller {
+            color: scroller_color,
+            border: Border::default().rounded(999.0),
+        },
+    };
+
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+    }
+}
+
 fn basic_slider<'a, F>(
     label: &'a str,
     min: f32,
@@ -2708,7 +3303,9 @@ where
         row![
             text(label).size(15),
             Space::with_width(Length::Fill),
-            text(format!("{value:.2}")).size(14).color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+            text(format!("{value:.2}"))
+                .size(14)
+                .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
         ]
         .align_y(iced::alignment::Vertical::Center),
         slider(min..=max, value, on_change)
@@ -2719,7 +3316,11 @@ where
     .into()
 }
 
-fn tone_mapper_button<'a>(label: &'a str, value: ToneMapper, selected: ToneMapper) -> Element<'a, Message> {
+fn tone_mapper_button<'a>(
+    label: &'a str,
+    value: ToneMapper,
+    selected: ToneMapper,
+) -> Element<'a, Message> {
     let active = value == selected;
     button(text(label).size(14))
         .padding([10, 16])
@@ -2730,7 +3331,11 @@ fn tone_mapper_button<'a>(label: &'a str, value: ToneMapper, selected: ToneMappe
             } else {
                 Color::from_rgb8(0x21, 0x28, 0x35)
             }));
-            style.text_color = if active { Color::from_rgb8(0x08, 0x12, 0x20) } else { Color::WHITE };
+            style.text_color = if active {
+                Color::from_rgb8(0x08, 0x12, 0x20)
+            } else {
+                Color::WHITE
+            };
             style.border.radius = 12.0.into();
             style
         })
@@ -2797,21 +3402,15 @@ fn adjustment_card<'a>(
     .style(iced::widget::button::text)
     .on_press(toggle_message);
 
-    container(
-        column![
-            header,
-            body_content,
-        ]
-        .spacing(12),
-    )
-    .padding(16)
-    .style(|_| container::Style {
-        text_color: Some(Color::WHITE),
-        background: Some(Background::Color(Color::from_rgb8(0x17, 0x1c, 0x27))),
-        border: Border::default().rounded(18.0),
-        ..container::Style::default()
-    })
-    .into()
+    container(column![header, body_content,].spacing(12))
+        .padding(16)
+        .style(|_| container::Style {
+            text_color: Some(Color::WHITE),
+            background: Some(Background::Color(Color::from_rgb8(0x17, 0x1c, 0x27))),
+            border: Border::default().rounded(18.0),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 fn icon_button<'a>(icon: &'a str, message: Message, _title: &'a str) -> Element<'a, Message> {
@@ -2829,15 +3428,11 @@ fn icon_button<'a>(icon: &'a str, message: Message, _title: &'a str) -> Element<
 }
 
 fn lut_picker_button<'a>(label: &'a str, has_lut: bool) -> Element<'a, Message> {
-    let button = button(
-        text(label)
-            .size(14)
-            .color(if has_lut {
-                Color::from_rgb8(0xe7, 0xec, 0xf6)
-            } else {
-                Color::from_rgb8(0xa8, 0xb2, 0xc8)
-            }),
-    )
+    let button = button(text(label).size(14).color(if has_lut {
+        Color::from_rgb8(0xe7, 0xec, 0xf6)
+    } else {
+        Color::from_rgb8(0xa8, 0xb2, 0xc8)
+    }))
     .width(Length::Fill)
     .padding([10, 12])
     .style(|theme, status| {
@@ -2852,9 +3447,13 @@ fn lut_picker_button<'a>(label: &'a str, has_lut: bool) -> Element<'a, Message> 
     tooltip(
         button,
         container(
-            text(if has_lut { "Choose a different LUT" } else { "Select a LUT file" })
-                .size(12)
-                .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
+            text(if has_lut {
+                "Choose a different LUT"
+            } else {
+                "Select a LUT file"
+            })
+            .size(12)
+            .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
         )
         .padding([6, 10])
         .style(|_| container::Style {
@@ -2890,19 +3489,25 @@ fn lut_browser_list<'a>(
         browser.entries.iter().enumerate().collect::<Vec<_>>()
     };
 
-    visible_entries.into_iter().fold(
-        column![muted_line(format!("{folder_label} • {} LUTs", browser.entries.len()))].spacing(6),
-        |column, (index, entry)| {
-            column.push(lut_browser_item(
-                index,
-                entry,
-                selected_lut_path == Some(entry.path.to_string_lossy().as_ref()),
-                !browser.collapsed && browser.hovered_index == Some(index),
-                browser.collapsed,
-            ))
-        },
-    )
-    .into()
+    visible_entries
+        .into_iter()
+        .fold(
+            column![muted_line(format!(
+                "{folder_label} • {} LUTs",
+                browser.entries.len()
+            ))]
+            .spacing(6),
+            |column, (index, entry)| {
+                column.push(lut_browser_item(
+                    index,
+                    entry,
+                    selected_lut_path == Some(entry.path.to_string_lossy().as_ref()),
+                    !browser.collapsed && browser.hovered_index == Some(index),
+                    browser.collapsed,
+                ))
+            },
+        )
+        .into()
 }
 
 fn lut_browser_item<'a>(
@@ -3006,15 +3611,15 @@ fn color_swatch_button<'a>(band: HslBand, selected: HslBand) -> Element<'a, Mess
                 ..container::Style::default()
             }),
     )
-        .width(Length::Fill)
-        .height(Length::Fixed(28.0))
-        .style(move |theme, status| {
-            let mut style = iced::widget::button::secondary(theme, status);
-            style.background = Some(Background::Color(Color::TRANSPARENT));
-            style.border = Border::default().rounded(999.0);
-            style
-        })
-        .on_press(Message::ActiveHslBandChanged(band));
+    .width(Length::Fill)
+    .height(Length::Fixed(28.0))
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(Color::TRANSPARENT));
+        style.border = Border::default().rounded(999.0);
+        style
+    })
+    .on_press(Message::ActiveHslBandChanged(band));
 
     tooltip(
         swatch,
@@ -3054,20 +3659,14 @@ fn color_grading_wheel_panel<'a>(
             .size(15)
             .color(Color::from_rgb8(0xd8, 0xe1, 0xf0)),
         stack![wheel_background, wheel],
-        basic_slider(
-            "Luminance",
-            -100.0,
-            100.0,
-            value.luminance,
-            move |amount| Message::ColorGradingZoneLuminanceChanged(zone, amount),
-        ),
+        basic_slider("Luminance", -100.0, 100.0, value.luminance, move |amount| {
+            Message::ColorGradingZoneLuminanceChanged(zone, amount)
+        },),
     ]
     .spacing(10)
     .align_x(iced::alignment::Horizontal::Center);
 
-    container(content)
-        .width(Length::Fill)
-        .into()
+    container(content).width(Length::Fill).into()
 }
 
 fn top_bar_icon_button<'a>(
@@ -3088,22 +3687,18 @@ fn top_bar_icon_button<'a>(
 
     tooltip(
         button,
-        container(
-            text(tip)
-                .size(12)
-                .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
-        )
-        .padding([6, 10])
-        .style(|_| container::Style {
-            text_color: Some(Color::WHITE),
-            background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
-            border: Border {
-                color: Color::from_rgba8(0xff, 0xff, 0xff, 0.08),
-                width: 1.0,
-                radius: 10.0.into(),
-            },
-            ..container::Style::default()
-        }),
+        container(text(tip).size(12).color(Color::from_rgb8(0xe2, 0xe8, 0xf0)))
+            .padding([6, 10])
+            .style(|_| container::Style {
+                text_color: Some(Color::WHITE),
+                background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+                border: Border {
+                    color: Color::from_rgba8(0xff, 0xff, 0xff, 0.08),
+                    width: 1.0,
+                    radius: 10.0.into(),
+                },
+                ..container::Style::default()
+            }),
         tooltip::Position::Bottom,
     )
     .gap(8)
@@ -3113,9 +3708,7 @@ fn top_bar_icon_button<'a>(
 fn header_status<'a>(status: &'a str) -> Element<'a, Message> {
     if status == "Preview updated." {
         row![
-            text("✓")
-                .size(13)
-                .color(Color::from_rgb8(0x86, 0xef, 0xac)),
+            text("✓").size(13).color(Color::from_rgb8(0x86, 0xef, 0xac)),
             text(status)
                 .size(13)
                 .color(Color::from_rgb8(0x86, 0xef, 0xac)),
@@ -3165,7 +3758,10 @@ impl canvas::Program<Message> for CurveEditor {
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
         let Some(position) = cursor.position_in(bounds) else {
-            if matches!(event, canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))) {
+            if matches!(
+                event,
+                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            ) {
                 state.dragging_index = None;
             }
             return (canvas::event::Status::Ignored, None);
@@ -3199,7 +3795,11 @@ impl canvas::Program<Message> for CurveEditor {
                 if let Some(index) = state.dragging_index {
                     let mut points = self.points.clone();
                     let mut point = point_from_position(position, bounds);
-                    let min_x = if index == 0 { 0.0 } else { points[index - 1].x + 0.5 };
+                    let min_x = if index == 0 {
+                        0.0
+                    } else {
+                        points[index - 1].x + 0.5
+                    };
                     let max_x = if index + 1 >= points.len() {
                         255.0
                     } else {
@@ -3225,7 +3825,10 @@ impl canvas::Program<Message> for CurveEditor {
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 state.dragging_index = None;
-                (canvas::event::Status::Captured, Some(Message::CommitPreviewRender))
+                (
+                    canvas::event::Status::Captured,
+                    Some(Message::CommitPreviewRender),
+                )
             }
             _ => (canvas::event::Status::Ignored, None),
         }
@@ -3273,7 +3876,10 @@ impl canvas::Program<Message> for CurveEditor {
         });
         frame.fill(
             &histogram_path,
-            Color { a: 0.18, ..self.color },
+            Color {
+                a: 0.18,
+                ..self.color
+            },
         );
 
         let curve_path = canvas::Path::new(|builder| {
@@ -3296,7 +3902,9 @@ impl canvas::Program<Message> for CurveEditor {
                 .with_width(2.5),
         );
 
-        let hovered = cursor.position_in(bounds).map(|position| point_from_position(position, bounds));
+        let hovered = cursor
+            .position_in(bounds)
+            .map(|position| point_from_position(position, bounds));
         for (index, point) in self.points.iter().enumerate() {
             let center = Point::new(
                 point.x / 255.0 * bounds.width,
@@ -3356,7 +3964,8 @@ impl canvas::Program<Message> for ColorWheelEditor {
         match event {
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(position) = position
-                    && let Some(updated) = color_grading_value_from_position(position, bounds, self.value)
+                    && let Some(updated) =
+                        color_grading_value_from_position(position, bounds, self.value)
                 {
                     state.dragging = true;
                     return (
@@ -3369,7 +3978,8 @@ impl canvas::Program<Message> for ColorWheelEditor {
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if state.dragging
                     && let Some(position) = position
-                    && let Some(updated) = color_grading_value_from_position(position, bounds, self.value)
+                    && let Some(updated) =
+                        color_grading_value_from_position(position, bounds, self.value)
                 {
                     return (
                         canvas::event::Status::Captured,
@@ -3381,7 +3991,10 @@ impl canvas::Program<Message> for ColorWheelEditor {
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
                 if state.dragging {
                     state.dragging = false;
-                    return (canvas::event::Status::Captured, Some(Message::CommitPreviewRender));
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::CommitPreviewRender),
+                    );
                 }
                 (canvas::event::Status::Ignored, None)
             }
@@ -3416,7 +4029,11 @@ impl canvas::Program<Message> for ColorWheelEditor {
         let inner = canvas::Path::circle(marker, 6.0);
         frame.fill(
             &inner,
-            hsv_to_color(self.value.hue, (self.value.saturation / 100.0).clamp(0.0, 1.0), 1.0),
+            hsv_to_color(
+                self.value.hue,
+                (self.value.saturation / 100.0).clamp(0.0, 1.0),
+                1.0,
+            ),
         );
 
         vec![frame.into_geometry()]
@@ -3431,7 +4048,9 @@ impl canvas::Program<Message> for ColorWheelEditor {
         if state.dragging
             || cursor
                 .position_in(bounds)
-                .and_then(|position| color_grading_value_from_position(position, bounds, self.value))
+                .and_then(|position| {
+                    color_grading_value_from_position(position, bounds, self.value)
+                })
                 .is_some()
         {
             mouse::Interaction::Pointer
@@ -3565,7 +4184,11 @@ fn evaluate_curve(points: &[CurvePoint], x: f32) -> f32 {
         let p2 = points[index + 1];
         if x <= p2.x {
             let p0 = if index == 0 { p1 } else { points[index - 1] };
-            let p3 = if index + 2 >= points.len() { p2 } else { points[index + 2] };
+            let p3 = if index + 2 >= points.len() {
+                p2
+            } else {
+                points[index + 2]
+            };
             let delta_before = (p1.y - p0.y) / (p1.x - p0.x).abs().max(0.001);
             let delta_current = (p2.y - p1.y) / (p2.x - p1.x).abs().max(0.001);
             let delta_after = (p3.y - p2.y) / (p3.x - p2.x).abs().max(0.001);
@@ -3575,11 +4198,16 @@ fn evaluate_curve(points: &[CurvePoint], x: f32) -> f32 {
             } else {
                 (delta_before + delta_current) / 2.0
             };
-            let mut tangent2 = if index + 1 == points.len() - 1 || delta_current * delta_after <= 0.0 {
-                if index + 1 == points.len() - 1 { delta_current } else { 0.0 }
-            } else {
-                (delta_current + delta_after) / 2.0
-            };
+            let mut tangent2 =
+                if index + 1 == points.len() - 1 || delta_current * delta_after <= 0.0 {
+                    if index + 1 == points.len() - 1 {
+                        delta_current
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (delta_current + delta_after) / 2.0
+                };
 
             if delta_current != 0.0 {
                 let alpha = tangent1 / delta_current;
