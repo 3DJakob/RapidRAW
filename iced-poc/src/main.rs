@@ -47,6 +47,7 @@ enum Message {
     ToggleBasicCard,
     ToggleCurvesCard,
     ToggleColorCard,
+    ToggleDetailsCard,
     ExposureChanged(f32),
     BrightnessChanged(f32),
     ContrastChanged(f32),
@@ -58,6 +59,13 @@ enum Message {
     TintChanged(f32),
     VibranceChanged(f32),
     SaturationChanged(f32),
+    SharpnessChanged(f32),
+    ClarityChanged(f32),
+    DehazeChanged(f32),
+    StructureChanged(f32),
+    CentreChanged(f32),
+    ChromaticAberrationRedCyanChanged(f32),
+    ChromaticAberrationBlueYellowChanged(f32),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
@@ -72,6 +80,7 @@ enum Message {
     ColorGradingBlendingChanged(f32),
     ColorGradingBalanceChanged(f32),
     ResetColorAdjustments,
+    ResetDetailsAdjustments,
     CommitPreviewRender,
     PreviewRendered {
         generation: u64,
@@ -88,6 +97,7 @@ struct App {
     basic_card: CardAnimation,
     curves_card: CardAnimation,
     color_card: CardAnimation,
+    details_card: CardAnimation,
     active_curve_channel: CurveChannel,
     active_hsl_band: HslBand,
     active_color_grading_zone: ColorGradingZone,
@@ -244,6 +254,10 @@ impl App {
                     expanded: false,
                     progress: 0.0,
                 },
+                details_card: CardAnimation {
+                    expanded: false,
+                    progress: 0.0,
+                },
                 active_curve_channel: CurveChannel::Luma,
                 active_hsl_band: HslBand::Reds,
                 active_color_grading_zone: ColorGradingZone::Midtones,
@@ -347,6 +361,7 @@ impl App {
                 step_card_animation(&mut self.basic_card);
                 step_card_animation(&mut self.curves_card);
                 step_card_animation(&mut self.color_card);
+                step_card_animation(&mut self.details_card);
             }
             Message::ToggleBasicCard => {
                 self.basic_card.expanded = !self.basic_card.expanded;
@@ -356,6 +371,9 @@ impl App {
             }
             Message::ToggleColorCard => {
                 self.color_card.expanded = !self.color_card.expanded;
+            }
+            Message::ToggleDetailsCard => {
+                self.details_card.expanded = !self.details_card.expanded;
             }
             Message::SelectImage(index) => {
                 if index < self.samples.len() {
@@ -425,6 +443,45 @@ impl App {
             Message::SaturationChanged(value) => {
                 self.basic_adjustments.saturation = value;
                 self.update_selected_adjustments(|adjustments| adjustments.saturation = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::SharpnessChanged(value) => {
+                self.basic_adjustments.sharpness = value;
+                self.update_selected_adjustments(|adjustments| adjustments.sharpness = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ClarityChanged(value) => {
+                self.basic_adjustments.clarity = value;
+                self.update_selected_adjustments(|adjustments| adjustments.clarity = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::DehazeChanged(value) => {
+                self.basic_adjustments.dehaze = value;
+                self.update_selected_adjustments(|adjustments| adjustments.dehaze = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::StructureChanged(value) => {
+                self.basic_adjustments.structure = value;
+                self.update_selected_adjustments(|adjustments| adjustments.structure = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::CentreChanged(value) => {
+                self.basic_adjustments.centre = value;
+                self.update_selected_adjustments(|adjustments| adjustments.centre = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ChromaticAberrationRedCyanChanged(value) => {
+                self.basic_adjustments.chromatic_aberration_red_cyan = value;
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.chromatic_aberration_red_cyan = value;
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ChromaticAberrationBlueYellowChanged(value) => {
+                self.basic_adjustments.chromatic_aberration_blue_yellow = value;
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.chromatic_aberration_blue_yellow = value;
+                });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ToneMapperChanged(value) => {
@@ -546,6 +603,25 @@ impl App {
                 });
                 return self.request_preview_render(PreviewQuality::Full);
             }
+            Message::ResetDetailsAdjustments => {
+                self.basic_adjustments.sharpness = 0.0;
+                self.basic_adjustments.clarity = 0.0;
+                self.basic_adjustments.dehaze = 0.0;
+                self.basic_adjustments.structure = 0.0;
+                self.basic_adjustments.centre = 0.0;
+                self.basic_adjustments.chromatic_aberration_red_cyan = 0.0;
+                self.basic_adjustments.chromatic_aberration_blue_yellow = 0.0;
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.sharpness = 0.0;
+                    adjustments.clarity = 0.0;
+                    adjustments.dehaze = 0.0;
+                    adjustments.structure = 0.0;
+                    adjustments.centre = 0.0;
+                    adjustments.chromatic_aberration_red_cyan = 0.0;
+                    adjustments.chromatic_aberration_blue_yellow = 0.0;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
             Message::CommitPreviewRender => {
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
@@ -581,6 +657,7 @@ impl App {
         (self.basic_card.progress - if self.basic_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
             || (self.curves_card.progress - if self.curves_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
             || (self.color_card.progress - if self.color_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
+            || (self.details_card.progress - if self.details_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
     }
 
     fn update_selected_adjustments(
@@ -1063,10 +1140,91 @@ impl App {
         ]
         .spacing(14);
 
+        let details_body = column![
+            row![
+                text("Sharpening, presence, and chromatic aberration")
+                    .size(14)
+                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                Space::with_width(Length::Fill),
+                icon_button("↺", Message::ResetDetailsAdjustments, "Reset details adjustments"),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+            card_section(
+                "Sharpening",
+                column![basic_slider(
+                    "Sharpness",
+                    -100.0,
+                    100.0,
+                    self.basic_adjustments.sharpness,
+                    Message::SharpnessChanged,
+                )]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Presence",
+                column![
+                    basic_slider(
+                        "Clarity",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.clarity,
+                        Message::ClarityChanged,
+                    ),
+                    basic_slider(
+                        "Dehaze",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.dehaze,
+                        Message::DehazeChanged,
+                    ),
+                    basic_slider(
+                        "Structure",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.structure,
+                        Message::StructureChanged,
+                    ),
+                    basic_slider(
+                        "Centre",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.centre,
+                        Message::CentreChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Chromatic Aberration",
+                column![
+                    basic_slider(
+                        "Red/Cyan",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.chromatic_aberration_red_cyan,
+                        Message::ChromaticAberrationRedCyanChanged,
+                    ),
+                    basic_slider(
+                        "Blue/Yellow",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.chromatic_aberration_blue_yellow,
+                        Message::ChromaticAberrationBlueYellowChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+        ]
+        .spacing(14);
+
         let controls = column![
             adjustment_card("Basic", self.basic_card, Message::ToggleBasicCard, basic_body.into(), 430.0),
             adjustment_card("Curves", self.curves_card, Message::ToggleCurvesCard, curves_body, 320.0),
             adjustment_card("Color", self.color_card, Message::ToggleColorCard, color_body.into(), 1180.0),
+            adjustment_card("Details", self.details_card, Message::ToggleDetailsCard, details_body.into(), 620.0),
             text("Preview updates live for the selected image.")
                 .size(13)
                 .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
@@ -1441,6 +1599,27 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
         temperature: value.get("temperature").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         tint: value.get("tint").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         vibrance: value.get("vibrance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        sharpness: value.get("sharpness").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        luma_noise_reduction: value
+            .get("lumaNoiseReduction")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        color_noise_reduction: value
+            .get("colorNoiseReduction")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        clarity: value.get("clarity").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        dehaze: value.get("dehaze").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        structure: value.get("structure").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        centre: value.get("centré").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        chromatic_aberration_red_cyan: value
+            .get("chromaticAberrationRedCyan")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        chromatic_aberration_blue_yellow: value
+            .get("chromaticAberrationBlueYellow")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
         tone_mapper,
         hsl: hsl_from_value(value.get("hsl").unwrap_or(&Value::Null)),
         color_grading: color_grading_from_value(value.get("colorGrading").unwrap_or(&Value::Null)),
@@ -1464,6 +1643,15 @@ fn adjustments_to_value(adjustments: &BasicAdjustments) -> Value {
         "temperature": adjustments.temperature,
         "tint": adjustments.tint,
         "vibrance": adjustments.vibrance,
+        "sharpness": adjustments.sharpness,
+        "lumaNoiseReduction": adjustments.luma_noise_reduction,
+        "colorNoiseReduction": adjustments.color_noise_reduction,
+        "clarity": adjustments.clarity,
+        "dehaze": adjustments.dehaze,
+        "structure": adjustments.structure,
+        "centré": adjustments.centre,
+        "chromaticAberrationRedCyan": adjustments.chromatic_aberration_red_cyan,
+        "chromaticAberrationBlueYellow": adjustments.chromatic_aberration_blue_yellow,
         "toneMapper": match adjustments.tone_mapper {
             ToneMapper::Basic => "basic",
             ToneMapper::AgX => "agx",

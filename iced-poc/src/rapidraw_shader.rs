@@ -146,6 +146,15 @@ pub struct BasicAdjustments {
     pub temperature: f32,
     pub tint: f32,
     pub vibrance: f32,
+    pub sharpness: f32,
+    pub luma_noise_reduction: f32,
+    pub color_noise_reduction: f32,
+    pub clarity: f32,
+    pub dehaze: f32,
+    pub structure: f32,
+    pub centre: f32,
+    pub chromatic_aberration_red_cyan: f32,
+    pub chromatic_aberration_blue_yellow: f32,
     pub tone_mapper: ToneMapper,
     pub hsl: HslSettings,
     pub color_grading: ColorGradingSettingsUi,
@@ -167,6 +176,15 @@ impl Default for BasicAdjustments {
             temperature: 0.0,
             tint: 0.0,
             vibrance: 0.0,
+            sharpness: 0.0,
+            luma_noise_reduction: 0.0,
+            color_noise_reduction: 0.0,
+            clarity: 0.0,
+            dehaze: 0.0,
+            structure: 0.0,
+            centre: 0.0,
+            chromatic_aberration_red_cyan: 0.0,
+            chromatic_aberration_blue_yellow: 0.0,
             tone_mapper: ToneMapper::AgX,
             hsl: HslSettings::default(),
             color_grading: ColorGradingSettingsUi::default(),
@@ -243,6 +261,10 @@ fn init_gpu_context() -> Result<GpuContext, String> {
 }
 
 struct MainPipeline {
+    blur_bgl: wgpu::BindGroupLayout,
+    h_blur_pipeline: wgpu::ComputePipeline,
+    v_blur_pipeline: wgpu::ComputePipeline,
+    blur_params_buffer: wgpu::Buffer,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     adjustments_buffer: wgpu::Buffer,
@@ -258,6 +280,80 @@ impl MainPipeline {
     fn new(context: &GpuContext) -> Result<Self, String> {
         let device = &context.device;
         const MAX_MASKS: u32 = 8;
+
+        let blur_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RapidRAW Blur Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../src-tauri/src/shaders/blur.wgsl").into(),
+            ),
+        });
+
+        let blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RapidRAW Blur BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let blur_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RapidRAW Blur Pipeline Layout"),
+            bind_group_layouts: &[&blur_bgl],
+            immediate_size: 0,
+        });
+
+        let h_blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RapidRAW Horizontal Blur"),
+            layout: Some(&blur_pipeline_layout),
+            module: &blur_shader_module,
+            entry_point: Some("horizontal_blur"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let v_blur_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("RapidRAW Vertical Blur"),
+            layout: Some(&blur_pipeline_layout),
+            module: &blur_shader_module,
+            entry_point: Some("vertical_blur"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let blur_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RapidRAW Blur Params"),
+            size: std::mem::size_of::<BlurParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RapidRAW Main Shader"),
@@ -450,6 +546,10 @@ impl MainPipeline {
         });
 
         Ok(Self {
+            blur_bgl,
+            h_blur_pipeline,
+            v_blur_pipeline,
+            blur_params_buffer,
             bind_group_layout,
             pipeline,
             adjustments_buffer,
@@ -514,8 +614,136 @@ impl MainPipeline {
         });
         let output_view = output_texture.create_view(&Default::default());
 
+        let blur_texture_desc = wgpu::TextureDescriptor {
+            label: Some("RapidRAW Blur Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        };
+        let ping_pong_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Blur PingPong"),
+            ..blur_texture_desc
+        });
+        let ping_pong_view = ping_pong_texture.create_view(&Default::default());
+        let sharpness_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Sharpness Blur"),
+            ..blur_texture_desc
+        });
+        let sharpness_blur_view = sharpness_blur_texture.create_view(&Default::default());
+        let tonal_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Tonal Blur"),
+            ..blur_texture_desc
+        });
+        let tonal_blur_view = tonal_blur_texture.create_view(&Default::default());
+        let clarity_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Clarity Blur"),
+            ..blur_texture_desc
+        });
+        let clarity_blur_view = clarity_blur_texture.create_view(&Default::default());
+        let structure_blur_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Structure Blur"),
+            ..blur_texture_desc
+        });
+        let structure_blur_view = structure_blur_texture.create_view(&Default::default());
+
         let all_adjustments = build_all_adjustments(adjustments, is_raw);
         queue.write_buffer(&self.adjustments_buffer, 0, bytemuck::bytes_of(&all_adjustments));
+
+        let run_blur = |radius: u32, output_view: &wgpu::TextureView| -> bool {
+            if radius == 0 {
+                return false;
+            }
+
+            let params = BlurParams {
+                radius,
+                tile_offset_x: 0,
+                tile_offset_y: 0,
+                input_width: width,
+                input_height: height,
+                _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+            };
+            queue.write_buffer(&self.blur_params_buffer, 0, bytemuck::bytes_of(&params));
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("RapidRAW Blur Encoder"),
+            });
+
+            let h_blur_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW H-Blur BG"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&ping_pong_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.blur_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW H-Blur Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.h_blur_pipeline);
+                cpass.set_bind_group(0, &h_blur_bg, &[]);
+                cpass.dispatch_workgroups((width + 255) / 256, height, 1);
+            }
+
+            let v_blur_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW V-Blur BG"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&ping_pong_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(output_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.blur_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW V-Blur Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.v_blur_pipeline);
+                cpass.set_bind_group(0, &v_blur_bg, &[]);
+                cpass.dispatch_workgroups(width, (height + 255) / 256, 1);
+            }
+
+            queue.submit(Some(encoder.finish()));
+            true
+        };
+
+        let did_create_sharpness_blur = run_blur(1, &sharpness_blur_view);
+        let did_create_tonal_blur = run_blur(4, &tonal_blur_view);
+        let did_create_clarity_blur = run_blur(8, &clarity_blur_view);
+        let did_create_structure_blur = run_blur(40, &structure_blur_view);
 
         const MAX_MASKS: usize = 8;
         let mut entries = vec![
@@ -549,12 +777,38 @@ impl MainPipeline {
             resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
         });
 
-        for binding in [13, 14, 15, 16] {
-            entries.push(wgpu::BindGroupEntry {
-                binding,
-                resource: wgpu::BindingResource::TextureView(&self.dummy_blur_view),
-            });
-        }
+        entries.push(wgpu::BindGroupEntry {
+            binding: 13,
+            resource: wgpu::BindingResource::TextureView(if did_create_sharpness_blur {
+                &sharpness_blur_view
+            } else {
+                &self.dummy_blur_view
+            }),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 14,
+            resource: wgpu::BindingResource::TextureView(if did_create_tonal_blur {
+                &tonal_blur_view
+            } else {
+                &self.dummy_blur_view
+            }),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 15,
+            resource: wgpu::BindingResource::TextureView(if did_create_clarity_blur {
+                &clarity_blur_view
+            } else {
+                &self.dummy_blur_view
+            }),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 16,
+            resource: wgpu::BindingResource::TextureView(if did_create_structure_blur {
+                &structure_blur_view
+            } else {
+                &self.dummy_blur_view
+            }),
+        });
         entries.push(wgpu::BindGroupEntry {
             binding: 17,
             resource: wgpu::BindingResource::TextureView(&self.dummy_flare_view),
@@ -686,6 +940,19 @@ struct Point {
     y: f32,
     _pad1: f32,
     _pad2: f32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
+#[repr(C)]
+struct BlurParams {
+    radius: u32,
+    tile_offset_x: u32,
+    tile_offset_y: u32,
+    input_width: u32,
+    input_height: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
@@ -891,6 +1158,17 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     all.global.temperature = adjustments.temperature / 25.0;
     all.global.tint = adjustments.tint / 100.0;
     all.global.vibrance = adjustments.vibrance / 100.0;
+    all.global.sharpness = adjustments.sharpness / 40.0;
+    all.global.luma_noise_reduction = adjustments.luma_noise_reduction / 100.0;
+    all.global.color_noise_reduction = adjustments.color_noise_reduction / 100.0;
+    all.global.clarity = adjustments.clarity / 200.0;
+    all.global.dehaze = adjustments.dehaze / 750.0;
+    all.global.structure = adjustments.structure / 200.0;
+    all.global.centré = adjustments.centre / 250.0;
+    all.global.chromatic_aberration_red_cyan =
+        adjustments.chromatic_aberration_red_cyan / 10000.0;
+    all.global.chromatic_aberration_blue_yellow =
+        adjustments.chromatic_aberration_blue_yellow / 10000.0;
     all.global.is_raw_image = if is_raw { 1 } else { 0 };
     all.global.tonemapper_mode = if matches!(adjustments.tone_mapper, ToneMapper::AgX) {
         1
