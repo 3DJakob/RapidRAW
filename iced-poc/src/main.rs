@@ -8,9 +8,10 @@ use iced::widget::{
     text, tooltip,
 };
 use iced::{
-    Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme,
-    application, keyboard, mouse, window,
+    Background, Border, Color, Element, Font, Length, Point, Rectangle, Size, Subscription, Task,
+    Theme, application, keyboard, mouse, window,
 };
+use lucide_icons::{Icon as LucideIcon, LUCIDE_FONT_BYTES};
 use rapidraw_shader::{
     BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint,
     CurvesSettings, HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points,
@@ -32,6 +33,7 @@ use std::time::Instant;
 
 fn main() -> iced::Result {
     application("RapidRAW Iced POC Preview", App::update, App::view)
+        .font(LUCIDE_FONT_BYTES)
         .theme(App::theme)
         .subscription(App::subscription)
         .window(window::Settings {
@@ -216,6 +218,18 @@ struct RenderedPreview {
 struct ThumbnailCanvas {
     handle: image::Handle,
     corner_radius: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AppIcon {
+    ArrowLeft,
+    Check,
+    ChevronDown,
+    ChevronUp,
+    FolderOpen,
+    RotateCcw,
+    Star,
+    X,
 }
 
 const FILMSTRIP_CARD_RADIUS: f32 = 14.0;
@@ -1390,9 +1404,9 @@ impl App {
         };
 
         let top_bar = row![
-            top_bar_icon_button("←", Some(Message::BackToHome), "Back"),
+            top_bar_icon_button(AppIcon::ArrowLeft, Some(Message::BackToHome), "Back"),
             top_bar_icon_button(
-                "⌂",
+                AppIcon::FolderOpen,
                 (!self.is_loading).then_some(Message::OpenFolder),
                 "Open folder",
             ),
@@ -1571,7 +1585,7 @@ impl App {
             let base: Element<'a, Message> = card.into();
             let badge: Element<'a, Message> = container(
                 row![
-                    text("★").size(11).color(Color::from_rgb8(0xf8, 0xe1, 0x6c)),
+                    app_icon(AppIcon::Star, 11.0, Color::from_rgb8(0xf8, 0xe1, 0x6c)),
                     text(sample.rating.to_string()).size(11).color(Color::WHITE),
                 ]
                 .spacing(4)
@@ -1618,12 +1632,9 @@ impl App {
     fn view_basic_panel(&self) -> Element<'_, Message> {
         let basic_body = column![
             row![
-                text("RapidRAW-inspired exposure and tone controls")
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
                 icon_button(
-                    "↺",
+                    AppIcon::RotateCcw,
                     Message::ResetBasicAdjustments,
                     "Reset basic adjustments"
                 ),
@@ -1719,12 +1730,9 @@ impl App {
 
             column![
                 row![
-                    text("Tone curves with histogram overlay")
-                        .size(14)
-                        .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                     Space::with_width(Length::Fill),
                     icon_button(
-                        "↺",
+                        AppIcon::RotateCcw,
                         Message::ResetCurveChannel(self.active_curve_channel),
                         "Reset curve channel"
                     ),
@@ -1748,12 +1756,9 @@ impl App {
         let current_hsl = *hsl_band(&self.basic_adjustments.hsl, self.active_hsl_band);
         let color_body = column![
             row![
-                text("White balance, grading, mixer, and calibration")
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
                 icon_button(
-                    "↺",
+                    AppIcon::RotateCcw,
                     Message::ResetColorAdjustments,
                     "Reset color adjustments"
                 ),
@@ -1888,12 +1893,9 @@ impl App {
 
         let details_body = column![
             row![
-                text("Sharpening, presence, and chromatic aberration")
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
                 icon_button(
-                    "↺",
+                    AppIcon::RotateCcw,
                     Message::ResetDetailsAdjustments,
                     "Reset details adjustments"
                 ),
@@ -1972,12 +1974,9 @@ impl App {
 
         let effects_body = column![
             row![
-                text("Creative effects, vignette, and grain")
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
                 Space::with_width(Length::Fill),
                 icon_button(
-                    "↺",
+                    AppIcon::RotateCcw,
                     Message::ResetEffectsAdjustments,
                     "Reset effects adjustments"
                 ),
@@ -2022,9 +2021,9 @@ impl App {
                                 .unwrap_or("Select LUT"),
                             self.basic_adjustments.lut_name.is_some(),
                         ),
-                        icon_button("[]", Message::SelectLutFolder, "Choose LUT folder"),
+                        icon_button(AppIcon::FolderOpen, Message::SelectLutFolder, "Choose LUT folder"),
                         if self.basic_adjustments.lut_name.is_some() {
-                            icon_button("×", Message::ClearLut, "Clear LUT")
+                            icon_button(AppIcon::X, Message::ClearLut, "Clear LUT")
                         } else {
                             Space::with_width(Length::Shrink).into()
                         },
@@ -2164,23 +2163,23 @@ impl App {
                 effects_body.into(),
                 700.0
             ),
-            text("Preview updates live for the selected image.")
-                .size(13)
-                .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
         ]
         .spacing(16);
 
         container(
-            scrollable(controls)
+            scrollable(
+                container(controls)
+                    .padding([20, 14])
+                    .width(Length::Fill)
+            )
                 .direction(scrollable::Direction::Vertical(
                     scrollable::Scrollbar::new()
                         .width(4)
-                        .margin(1)
+                        .margin(0)
                         .scroller_width(4),
                 ))
                 .style(discrete_scrollbar_style),
         )
-        .padding(20)
         .height(Length::Fill)
         .style(panel_style)
         .into()
@@ -3378,44 +3377,111 @@ fn adjustment_card<'a>(
     expanded_height: f32,
 ) -> Element<'a, Message> {
     let expanded = card.expanded;
+    let eased_progress = ease_in_out(card.progress);
+    let body_spacing = if card.progress > 0.01 { 12 } else { 0 };
     let body_content: Element<'a, Message> = if card.progress >= 0.99 {
         container(body).into()
     } else if card.progress > 0.01 {
         container(body)
-            .height(Length::Fixed((expanded_height * card.progress).max(1.0)))
+            .height(Length::Fixed((expanded_height * eased_progress).max(1.0)))
             .into()
     } else {
         Space::with_height(Length::Shrink).into()
     };
 
+    let is_collapsed = card.progress <= 0.01;
+
     let header = button(
-        row![
-            text(title).size(20),
-            Space::with_width(Length::Fill),
-            text(if expanded { "▾" } else { "▸" })
-                .size(18)
-                .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
-        ]
+        container(
+            row![
+                text(title).size(20),
+                Space::with_width(Length::Fill),
+                app_icon(
+                    if expanded {
+                        AppIcon::ChevronUp
+                    } else {
+                        AppIcon::ChevronDown
+                    },
+                    18.0,
+                    Color::from_rgb8(0xa8, 0xb2, 0xc8),
+                ),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
         .align_y(iced::alignment::Vertical::Center),
     )
-    .padding([4, 0])
-    .style(iced::widget::button::text)
+    .width(Length::Fill)
+    .height(Length::Fixed(52.0))
+    .padding([0, 12])
+    .style(|theme, status| {
+        let mut style = iced::widget::button::text(theme, status);
+        let background = match status {
+            iced::widget::button::Status::Active => Color::from_rgb8(0x1d, 0x24, 0x31),
+            iced::widget::button::Status::Hovered => Color::from_rgb8(0x23, 0x2b, 0x3a),
+            iced::widget::button::Status::Pressed => Color::from_rgb8(0x26, 0x30, 0x40),
+            iced::widget::button::Status::Disabled => Color::from_rgb8(0x1d, 0x24, 0x31),
+        };
+        style.background = Some(Background::Color(background));
+        style.border.radius = 16.0.into();
+        style
+    })
     .on_press(toggle_message);
 
-    container(column![header, body_content,].spacing(12))
-        .padding(16)
-        .style(|_| container::Style {
-            text_color: Some(Color::WHITE),
-            background: Some(Background::Color(Color::from_rgb8(0x17, 0x1c, 0x27))),
-            border: Border::default().rounded(18.0),
-            ..container::Style::default()
-        })
+    container(
+        column![
+            header,
+            container(body_content)
+                .padding(if is_collapsed { 0 } else { 16 })
+        ]
+        .spacing(body_spacing),
+    )
+    .style(|_| container::Style {
+        text_color: Some(Color::WHITE),
+        background: Some(Background::Color(Color::from_rgb8(0x17, 0x1c, 0x27))),
+        border: Border::default().rounded(18.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn app_icon<'a>(icon: AppIcon, size: f32, color: Color) -> Element<'a, Message> {
+    text(char::from(lucide_icon(icon)).to_string())
+        .font(Font::with_name("lucide"))
+        .size(size)
+        .color(color)
         .into()
 }
 
-fn icon_button<'a>(icon: &'a str, message: Message, _title: &'a str) -> Element<'a, Message> {
-    button(text(icon).size(16))
-        .padding([7, 10])
+fn lucide_icon(icon: AppIcon) -> LucideIcon {
+    match icon {
+        AppIcon::ArrowLeft => LucideIcon::ArrowLeft,
+        AppIcon::Check => LucideIcon::Check,
+        AppIcon::ChevronDown => LucideIcon::ChevronDown,
+        AppIcon::ChevronUp => LucideIcon::ChevronUp,
+        AppIcon::FolderOpen => LucideIcon::FolderOpen,
+        AppIcon::RotateCcw => LucideIcon::Undo2,
+        AppIcon::Star => LucideIcon::Star,
+        AppIcon::X => LucideIcon::X,
+    }
+}
+
+fn icon_button<'a>(icon: AppIcon, message: Message, _title: &'a str) -> Element<'a, Message> {
+    button(
+        container(app_icon(
+            icon,
+            16.0,
+            Color::from_rgb8(0xe2, 0xe8, 0xf0),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center),
+    )
+        .width(Length::Fixed(34.0))
+        .height(Length::Fixed(34.0))
+        .padding(0)
         .style(move |theme, status| {
             let mut style = iced::widget::button::secondary(theme, status);
             style.background = Some(Background::Color(Color::from_rgb8(0x21, 0x28, 0x35)));
@@ -3583,7 +3649,7 @@ fn muted_line<'a>(content: impl Into<String>) -> Element<'a, Message> {
 }
 
 fn lut_selected_check<'a>() -> Element<'a, Message> {
-    text("▾").size(14).color(Color::WHITE).into()
+    app_icon(AppIcon::ChevronDown, 14.0, Color::WHITE)
 }
 
 fn color_swatch_button<'a>(band: HslBand, selected: HslBand) -> Element<'a, Message> {
@@ -3669,12 +3735,12 @@ fn color_grading_wheel_panel<'a>(
     container(content).width(Length::Fill).into()
 }
 
-fn top_bar_icon_button<'a>(
-    icon: &'a str,
-    message: Option<Message>,
-    tip: &'a str,
-) -> Element<'a, Message> {
-    let button = button(text(icon).size(18))
+fn top_bar_icon_button<'a>(icon: AppIcon, message: Option<Message>, tip: &'a str) -> Element<'a, Message> {
+    let button = button(app_icon(
+        icon,
+        18.0,
+        Color::from_rgb8(0xe2, 0xe8, 0xf0),
+    ))
         .padding([10, 12])
         .style(|theme, status| {
             let mut style = iced::widget::button::secondary(theme, status);
@@ -3708,7 +3774,7 @@ fn top_bar_icon_button<'a>(
 fn header_status<'a>(status: &'a str) -> Element<'a, Message> {
     if status == "Preview updated." {
         row![
-            text("✓").size(13).color(Color::from_rgb8(0x86, 0xef, 0xac)),
+            app_icon(AppIcon::Check, 13.0, Color::from_rgb8(0x86, 0xef, 0xac)),
             text(status)
                 .size(13)
                 .color(Color::from_rgb8(0x86, 0xef, 0xac)),
@@ -3731,12 +3797,20 @@ fn header_status<'a>(status: &'a str) -> Element<'a, Message> {
 
 fn step_card_animation(card: &mut CardAnimation) {
     let target = if card.expanded { 1.0 } else { 0.0 };
-    let delta = target - card.progress;
-    if delta.abs() < 0.01 {
+    let step = 0.10;
+
+    if (target - card.progress).abs() <= step {
         card.progress = target;
+    } else if card.expanded {
+        card.progress = (card.progress + step).clamp(0.0, 1.0);
     } else {
-        card.progress = (card.progress + delta * 0.22).clamp(0.0, 1.0);
+        card.progress = (card.progress - step).clamp(0.0, 1.0);
     }
+}
+
+fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[derive(Debug, Clone)]
