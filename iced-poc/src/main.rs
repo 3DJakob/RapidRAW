@@ -12,7 +12,7 @@ use rawler::{
 };
 use rapidraw_shader::{
     BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint, CurvesSettings,
-    HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points,
+    HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points, parse_lut_metadata,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -77,6 +77,13 @@ enum Message {
     GrainAmountChanged(f32),
     GrainSizeChanged(f32),
     GrainRoughnessChanged(f32),
+    SelectLut,
+    SelectLutFolder,
+    LutFolderLoaded(Result<LutBrowserState, String>),
+    ClearLut,
+    LutIntensityChanged(f32),
+    HoverLut(Option<usize>),
+    ApplyLutFromBrowser(usize),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
@@ -118,11 +125,27 @@ struct App {
     is_loading: bool,
     status_message: Option<String>,
     basic_adjustments: BasicAdjustments,
+    lut_browser: LutBrowserState,
     rendered_preview: Option<image::Handle>,
     preview_generation: u64,
     is_rendering_preview: bool,
     pending_preview_quality: Option<PreviewQuality>,
     renderer: Option<RapidRawRenderer>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LutBrowserState {
+    folder: Option<PathBuf>,
+    entries: Vec<LutListEntry>,
+    hovered_index: Option<usize>,
+    collapsed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct LutListEntry {
+    name: String,
+    path: PathBuf,
+    size: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +305,7 @@ impl App {
                 is_loading: false,
                 status_message,
                 basic_adjustments: BasicAdjustments::default(),
+                lut_browser: LutBrowserState::default(),
                 rendered_preview: None,
                 preview_generation: 0,
                 is_rendering_preview: false,
@@ -555,6 +579,114 @@ impl App {
                 self.update_selected_adjustments(|adjustments| adjustments.grain_roughness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
+            Message::SelectLut => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("LUT Files", &["cube", "3dl", "png", "jpg", "jpeg", "tiff", "tif"])
+                    .pick_file()
+                {
+                    match parse_lut_metadata(&path) {
+                        Ok(lut_size) => {
+                            let lut_name = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("LUT")
+                                .to_string();
+                            let lut_path = path.to_string_lossy().to_string();
+                            self.basic_adjustments.lut_path = Some(lut_path.clone());
+                            self.basic_adjustments.lut_name = Some(lut_name.clone());
+                            self.basic_adjustments.lut_size = lut_size;
+                            self.update_selected_adjustments(|adjustments| {
+                                adjustments.lut_path = Some(lut_path.clone());
+                                adjustments.lut_name = Some(lut_name.clone());
+                                adjustments.lut_size = lut_size;
+                            });
+                            self.status_message = Some(format!("Loaded LUT {} ({lut_size}^3).", lut_name));
+                            return self.request_preview_render(PreviewQuality::Full);
+                        }
+                        Err(error) => {
+                            self.status_message = Some(format!("Failed to load LUT: {error}"));
+                        }
+                    }
+                }
+            }
+            Message::SelectLutFolder => {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.status_message = Some(format!("Loading LUTs from {}...", path.display()));
+                    return Task::perform(load_lut_folder_task(path), Message::LutFolderLoaded);
+                }
+            }
+            Message::LutFolderLoaded(result) => match result {
+                Ok(browser) => {
+                    let count = browser.entries.len();
+                    let folder_label = browser
+                        .folder
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default();
+                    self.lut_browser = browser;
+                    self.status_message = Some(format!(
+                        "Loaded {count} LUT{} from {folder_label}",
+                        if count == 1 { "" } else { "s" }
+                    ));
+                }
+                Err(error) => {
+                    self.status_message = Some(error);
+                }
+            },
+            Message::ClearLut => {
+                self.basic_adjustments.lut_path = None;
+                self.basic_adjustments.lut_name = None;
+                self.basic_adjustments.lut_size = 0;
+                self.basic_adjustments.lut_intensity = 100.0;
+                self.lut_browser.hovered_index = None;
+                self.lut_browser.collapsed = false;
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.lut_path = None;
+                    adjustments.lut_name = None;
+                    adjustments.lut_size = 0;
+                    adjustments.lut_intensity = 100.0;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::LutIntensityChanged(value) => {
+                self.basic_adjustments.lut_intensity = value;
+                self.update_selected_adjustments(|adjustments| adjustments.lut_intensity = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::HoverLut(index) => {
+                if self.lut_browser.collapsed {
+                    return Task::none();
+                }
+                if self.lut_browser.hovered_index != index {
+                    self.lut_browser.hovered_index = index;
+                    if !self.samples.is_empty() {
+                        return self.request_preview_render(PreviewQuality::Interactive);
+                    }
+                }
+            }
+            Message::ApplyLutFromBrowser(index) => {
+                if let Some(entry) = self.lut_browser.entries.get(index).cloned() {
+                    let lut_path = entry.path.to_string_lossy().to_string();
+                    let already_selected = self.basic_adjustments.lut_path.as_deref() == Some(lut_path.as_str());
+                    if already_selected {
+                        self.lut_browser.collapsed = !self.lut_browser.collapsed;
+                        self.lut_browser.hovered_index = None;
+                        return Task::none();
+                    }
+                    self.basic_adjustments.lut_path = Some(lut_path.clone());
+                    self.basic_adjustments.lut_name = Some(entry.name.clone());
+                    self.basic_adjustments.lut_size = entry.size;
+                    self.lut_browser.hovered_index = None;
+                    self.lut_browser.collapsed = true;
+                    self.update_selected_adjustments(|adjustments| {
+                        adjustments.lut_path = Some(lut_path.clone());
+                        adjustments.lut_name = Some(entry.name.clone());
+                        adjustments.lut_size = entry.size;
+                    });
+                    self.status_message = Some(format!("Applied LUT {}.", entry.name));
+                    return self.request_preview_render(PreviewQuality::Full);
+                }
+            }
             Message::ToneMapperChanged(value) => {
                 self.basic_adjustments.tone_mapper = value;
                 self.update_selected_adjustments(|adjustments| adjustments.tone_mapper = value);
@@ -697,6 +829,10 @@ impl App {
                 self.basic_adjustments.glow_amount = 0.0;
                 self.basic_adjustments.halation_amount = 0.0;
                 self.basic_adjustments.flare_amount = 0.0;
+                self.basic_adjustments.lut_path = None;
+                self.basic_adjustments.lut_name = None;
+                self.basic_adjustments.lut_size = 0;
+                self.basic_adjustments.lut_intensity = 100.0;
                 self.basic_adjustments.vignette_amount = 0.0;
                 self.basic_adjustments.vignette_midpoint = 50.0;
                 self.basic_adjustments.vignette_roundness = 0.0;
@@ -708,6 +844,10 @@ impl App {
                     adjustments.glow_amount = 0.0;
                     adjustments.halation_amount = 0.0;
                     adjustments.flare_amount = 0.0;
+                    adjustments.lut_path = None;
+                    adjustments.lut_name = None;
+                    adjustments.lut_size = 0;
+                    adjustments.lut_intensity = 100.0;
                     adjustments.vignette_amount = 0.0;
                     adjustments.vignette_midpoint = 50.0;
                     adjustments.vignette_roundness = 0.0;
@@ -1355,6 +1495,55 @@ impl App {
                 .into(),
             ),
             card_section(
+                "LUT",
+                column![
+                    row![
+                        lut_picker_button(
+                            self.basic_adjustments
+                                .lut_name
+                                .as_deref()
+                                .unwrap_or("Select LUT"),
+                            self.basic_adjustments.lut_name.is_some(),
+                        ),
+                        icon_button("[]", Message::SelectLutFolder, "Choose LUT folder"),
+                        if self.basic_adjustments.lut_name.is_some() {
+                            icon_button("×", Message::ClearLut, "Clear LUT")
+                        } else {
+                            Space::with_width(Length::Shrink).into()
+                        },
+                    ]
+                    .spacing(8)
+                    .align_y(iced::alignment::Vertical::Center),
+                    if let Some(lut_name) = &self.basic_adjustments.lut_name {
+                        muted_line(format!(
+                            "{} • {}^3",
+                            lut_name,
+                            self.basic_adjustments.lut_size
+                        ))
+                    } else {
+                        muted_line("Load a .cube, .3dl, or HALD image LUT.")
+                    },
+                    if self.basic_adjustments.lut_name.is_some() {
+                        basic_slider(
+                            "Intensity",
+                            0.0,
+                            100.0,
+                            self.basic_adjustments.lut_intensity,
+                            Message::LutIntensityChanged,
+                        )
+                    } else {
+                        Space::with_height(Length::Shrink).into()
+                    },
+                    if self.lut_browser.folder.is_some() {
+                        lut_browser_list(&self.lut_browser, self.basic_adjustments.lut_path.as_deref())
+                    } else {
+                        Space::with_height(Length::Shrink).into()
+                    },
+                ]
+                .spacing(10)
+                .into(),
+            ),
+            card_section(
                 "Vignette",
                 column![
                     basic_slider(
@@ -1466,7 +1655,16 @@ impl App {
             PreviewQuality::Interactive => sample.interactive_preview_image.clone(),
             PreviewQuality::Full => sample.full_preview_image.clone(),
         };
-        let adjustments = sample.adjustments.clone();
+        let mut adjustments = sample.adjustments.clone();
+        if let Some(entry) = self
+            .lut_browser
+            .hovered_index
+            .and_then(|index| self.lut_browser.entries.get(index))
+        {
+            adjustments.lut_path = Some(entry.path.to_string_lossy().to_string());
+            adjustments.lut_name = Some(entry.name.clone());
+            adjustments.lut_size = entry.size;
+        }
         let is_raw = sample.is_raw;
         self.is_rendering_preview = true;
         self.status_message = None;
@@ -1530,6 +1728,10 @@ async fn load_folder_task(path: PathBuf) -> Result<LoadedFolder, String> {
     load_folder(path)
 }
 
+async fn load_lut_folder_task(path: PathBuf) -> Result<LutBrowserState, String> {
+    load_lut_folder(path)
+}
+
 fn load_folder(path: PathBuf) -> Result<LoadedFolder, String> {
     let mut files = fs::read_dir(&path)
         .map_err(|error| format!("Failed to read folder {}: {}", path.display(), error))?
@@ -1546,6 +1748,43 @@ fn load_folder(path: PathBuf) -> Result<LoadedFolder, String> {
     }
 
     Ok(LoadedFolder { path, samples })
+}
+
+fn load_lut_folder(path: PathBuf) -> Result<LutBrowserState, String> {
+    let mut files = fs::read_dir(&path)
+        .map_err(|error| format!("Failed to read LUT folder {}: {}", path.display(), error))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|candidate| is_supported_lut(candidate))
+        .collect::<Vec<_>>();
+
+    files.sort();
+
+    let mut entries = Vec::new();
+    for file in files {
+        match parse_lut_metadata(&file) {
+            Ok(size) => {
+                let name = file
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("Untitled LUT")
+                    .replace(['-', '_'], " ");
+                entries.push(LutListEntry {
+                    name: title_case(&name),
+                    path: file,
+                    size,
+                });
+            }
+            Err(_error) => {}
+        }
+    }
+
+    Ok(LutBrowserState {
+        folder: Some(path),
+        entries,
+        hovered_index: None,
+        collapsed: false,
+    })
 }
 
 fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
@@ -1715,6 +1954,13 @@ fn is_supported_raw(path: &Path) -> bool {
     )
 }
 
+fn is_supported_lut(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()).map(|ext| ext.to_ascii_lowercase()),
+        Some(ext) if matches!(ext.as_str(), "cube" | "3dl" | "png" | "jpg" | "jpeg" | "tiff" | "tif")
+    )
+}
+
 fn title_case(input: &str) -> String {
     input
         .split_whitespace()
@@ -1846,6 +2092,13 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
             .and_then(Value::as_f64)
             .unwrap_or(0.0) as f32,
         flare_amount: value.get("flareAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        lut_path: value.get("lutPath").and_then(Value::as_str).map(ToOwned::to_owned),
+        lut_name: value.get("lutName").and_then(Value::as_str).map(ToOwned::to_owned),
+        lut_size: value.get("lutSize").and_then(Value::as_u64).unwrap_or(0) as u32,
+        lut_intensity: value
+            .get("lutIntensity")
+            .and_then(Value::as_f64)
+            .unwrap_or(100.0) as f32,
         tone_mapper,
         hsl: hsl_from_value(value.get("hsl").unwrap_or(&Value::Null)),
         color_grading: color_grading_from_value(value.get("colorGrading").unwrap_or(&Value::Null)),
@@ -1888,6 +2141,10 @@ fn adjustments_to_value(adjustments: &BasicAdjustments) -> Value {
         "glowAmount": adjustments.glow_amount,
         "halationAmount": adjustments.halation_amount,
         "flareAmount": adjustments.flare_amount,
+        "lutPath": adjustments.lut_path.clone(),
+        "lutName": adjustments.lut_name.clone(),
+        "lutSize": adjustments.lut_size,
+        "lutIntensity": adjustments.lut_intensity,
         "toneMapper": match adjustments.tone_mapper {
             ToneMapper::Basic => "basic",
             ToneMapper::AgX => "agx",
@@ -2377,6 +2634,126 @@ fn icon_button<'a>(icon: &'a str, message: Message, _title: &'a str) -> Element<
         .into()
 }
 
+fn lut_picker_button<'a>(label: &'a str, has_lut: bool) -> Element<'a, Message> {
+    let button = button(
+        text(label)
+            .size(14)
+            .color(if has_lut {
+                Color::from_rgb8(0xe7, 0xec, 0xf6)
+            } else {
+                Color::from_rgb8(0xa8, 0xb2, 0xc8)
+            }),
+    )
+    .width(Length::Fill)
+    .padding([10, 12])
+    .style(|theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(Color::from_rgb8(0x21, 0x28, 0x35)));
+        style.text_color = Color::WHITE;
+        style.border.radius = 12.0.into();
+        style
+    })
+    .on_press(Message::SelectLut);
+
+    tooltip(
+        button,
+        container(
+            text(if has_lut { "Choose a different LUT" } else { "Select a LUT file" })
+                .size(12)
+                .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
+        )
+        .padding([6, 10])
+        .style(|_| container::Style {
+            text_color: Some(Color::WHITE),
+            background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+            border: Border::default().rounded(10.0),
+            ..container::Style::default()
+        }),
+        tooltip::Position::Top,
+    )
+    .gap(8)
+    .into()
+}
+
+fn lut_browser_list<'a>(
+    browser: &'a LutBrowserState,
+    selected_lut_path: Option<&'a str>,
+) -> Element<'a, Message> {
+    let folder_label = browser
+        .folder
+        .as_ref()
+        .and_then(|path| path.file_name().and_then(|name| name.to_str()))
+        .unwrap_or("LUT Folder");
+
+    let visible_entries = if browser.collapsed {
+        browser
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| selected_lut_path == Some(entry.path.to_string_lossy().as_ref()))
+            .collect::<Vec<_>>()
+    } else {
+        browser.entries.iter().enumerate().collect::<Vec<_>>()
+    };
+
+    visible_entries.into_iter().fold(
+        column![muted_line(format!("{folder_label} • {} LUTs", browser.entries.len()))].spacing(6),
+        |column, (index, entry)| {
+            column.push(lut_browser_item(
+                index,
+                entry,
+                selected_lut_path == Some(entry.path.to_string_lossy().as_ref()),
+                !browser.collapsed && browser.hovered_index == Some(index),
+            ))
+        },
+    )
+    .into()
+}
+
+fn lut_browser_item<'a>(
+    index: usize,
+    entry: &'a LutListEntry,
+    selected: bool,
+    hovered: bool,
+) -> Element<'a, Message> {
+    let background = if hovered {
+        Color::from_rgb8(0x2a, 0x34, 0x46)
+    } else if selected {
+        Color::from_rgb8(0x1f, 0x2a, 0x3a)
+    } else {
+        Color::from_rgb8(0x1b, 0x22, 0x2f)
+    };
+
+    let content = container(
+        row![
+            text(&entry.name)
+                .size(14)
+                .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+            Space::with_width(Length::Fill),
+            if selected {
+                lut_selected_check()
+            } else {
+                Space::with_width(Length::Shrink).into()
+            },
+        ]
+        .align_y(iced::alignment::Vertical::Center),
+    )
+    .padding([9, 12])
+    .style(move |_| container::Style {
+        text_color: Some(Color::WHITE),
+        background: Some(Background::Color(background)),
+        border: Border::default().rounded(12.0),
+        ..container::Style::default()
+    });
+
+    mouse_area(content)
+        .on_enter(Message::HoverLut(Some(index)))
+        .on_exit(Message::HoverLut(None))
+        .on_press(Message::ApplyLutFromBrowser(index))
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
 fn card_section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
     container(
         column![
@@ -2395,6 +2772,17 @@ fn card_section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, M
         ..container::Style::default()
     })
     .into()
+}
+
+fn muted_line<'a>(content: impl Into<String>) -> Element<'a, Message> {
+    text(content.into())
+        .size(13)
+        .color(Color::from_rgb8(0x8d, 0x98, 0xae))
+        .into()
+}
+
+fn lut_selected_check<'a>() -> Element<'a, Message> {
+    text("✓").size(14).color(Color::WHITE).into()
 }
 
 fn color_swatch_button<'a>(band: HslBand, selected: HslBand) -> Element<'a, Message> {

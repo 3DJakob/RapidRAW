@@ -2,6 +2,10 @@ use ::image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec2, Vec3};
 use half::f16;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use wgpu::util::{DeviceExt, TextureDataOrder};
 
@@ -165,6 +169,10 @@ pub struct BasicAdjustments {
     pub glow_amount: f32,
     pub halation_amount: f32,
     pub flare_amount: f32,
+    pub lut_path: Option<String>,
+    pub lut_name: Option<String>,
+    pub lut_size: u32,
+    pub lut_intensity: f32,
     pub tone_mapper: ToneMapper,
     pub hsl: HslSettings,
     pub color_grading: ColorGradingSettingsUi,
@@ -205,6 +213,10 @@ impl Default for BasicAdjustments {
             glow_amount: 0.0,
             halation_amount: 0.0,
             flare_amount: 0.0,
+            lut_path: None,
+            lut_name: None,
+            lut_size: 0,
+            lut_intensity: 100.0,
             tone_mapper: ToneMapper::AgX,
             hsl: HslSettings::default(),
             color_grading: ColorGradingSettingsUi::default(),
@@ -212,6 +224,184 @@ impl Default for BasicAdjustments {
             curves: CurvesSettings::default(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct Lut {
+    size: u32,
+    data: Vec<f32>,
+}
+
+pub fn parse_lut_metadata(path: &Path) -> Result<u32, String> {
+    parse_lut_file(path).map(|lut| lut.size)
+}
+
+fn parse_lut_file(path: &Path) -> Result<Lut, String> {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    match extension.as_str() {
+        "cube" => parse_cube(path),
+        "3dl" => parse_3dl(path),
+        "png" | "jpg" | "jpeg" | "tiff" | "tif" => parse_hald_image(path),
+        _ => Err(format!("Unsupported LUT file format: {extension}")),
+    }
+}
+
+fn parse_cube(path: &Path) -> Result<Lut, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let reader = BufReader::new(file);
+
+    let mut size: Option<u32> = None;
+    let mut data = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| format!("Failed reading {}: {error}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        if parts.is_empty() {
+            continue;
+        }
+
+        match parts[0].to_ascii_uppercase().as_str() {
+            "TITLE" | "DOMAIN_MIN" | "DOMAIN_MAX" => continue,
+            "LUT_3D_SIZE" => {
+                let Some(raw_size) = parts.get(1) else {
+                    return Err(format!(
+                        "Malformed LUT_3D_SIZE in {} on line {}",
+                        path.display(),
+                        line_index + 1
+                    ));
+                };
+                size = Some(raw_size.parse::<u32>().map_err(|error| {
+                    format!(
+                        "Invalid LUT_3D_SIZE in {} on line {}: {error}",
+                        path.display(),
+                        line_index + 1
+                    )
+                })?);
+            }
+            _ if size.is_some() => {
+                if parts.len() < 3 {
+                    return Err(format!(
+                        "Invalid LUT row in {} on line {}",
+                        path.display(),
+                        line_index + 1
+                    ));
+                }
+                for channel in parts.iter().take(3) {
+                    data.push(channel.parse::<f32>().map_err(|error| {
+                        format!(
+                            "Invalid LUT value in {} on line {}: {error}",
+                            path.display(),
+                            line_index + 1
+                        )
+                    })?);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let size = size.ok_or_else(|| format!("LUT_3D_SIZE not found in {}", path.display()))?;
+    let expected_len = (size * size * size * 3) as usize;
+    if data.len() != expected_len {
+        return Err(format!(
+            "LUT data size mismatch in {}. Expected {}, found {}",
+            path.display(),
+            expected_len,
+            data.len()
+        ));
+    }
+
+    Ok(Lut { size, data })
+}
+
+fn parse_3dl(path: &Path) -> Result<Lut, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut data = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| format!("Failed reading {}: {error}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let parts = trimmed.split_whitespace().collect::<Vec<_>>();
+        if parts.len() != 3 {
+            continue;
+        }
+
+        for channel in parts {
+            data.push(channel.parse::<f32>().map_err(|error| {
+                format!(
+                    "Invalid LUT value in {} on line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                )
+            })?);
+        }
+    }
+
+    let entries = data.len() / 3;
+    if entries == 0 {
+        return Err(format!("No LUT data found in {}", path.display()));
+    }
+
+    let size = (entries as f64).cbrt().round() as u32;
+    if size * size * size != entries as u32 {
+        return Err(format!(
+            "3DL LUT in {} does not contain a cubic number of entries",
+            path.display()
+        ));
+    }
+
+    Ok(Lut { size, data })
+}
+
+fn parse_hald_image(path: &Path) -> Result<Lut, String> {
+    let image = ::image::open(path)
+        .map_err(|error| format!("Failed to open {}: {error}", path.display()))?;
+    let rgb = image.to_rgb8();
+    let (width, height) = rgb.dimensions();
+
+    if width != height {
+        return Err(format!(
+            "HALD LUT image {} must be square, found {}x{}",
+            path.display(),
+            width,
+            height
+        ));
+    }
+
+    let pixel_count = width * height;
+    let size = (pixel_count as f64).cbrt().round() as u32;
+    if size * size * size != pixel_count {
+        return Err(format!(
+            "HALD LUT image {} does not contain a cubic number of pixels",
+            path.display()
+        ));
+    }
+
+    let mut data = Vec::with_capacity((pixel_count * 3) as usize);
+    for pixel in rgb.pixels() {
+        data.push(pixel[0] as f32 / 255.0);
+        data.push(pixel[1] as f32 / 255.0);
+        data.push(pixel[2] as f32 / 255.0);
+    }
+
+    Ok(Lut { size, data })
 }
 
 #[derive(Clone)]
@@ -300,8 +490,14 @@ struct MainPipeline {
     dummy_blur_view: wgpu::TextureView,
     dummy_flare_view: wgpu::TextureView,
     dummy_lut_view: wgpu::TextureView,
-    lut_sampler: wgpu::Sampler,
+    dummy_lut_sampler: wgpu::Sampler,
     flare_sampler: wgpu::Sampler,
+    lut_cache: HashMap<PathBuf, CachedLut>,
+}
+
+struct CachedLut {
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
 }
 
 impl MainPipeline {
@@ -709,7 +905,14 @@ impl MainPipeline {
         });
         let dummy_lut_view = dummy_lut_texture.create_view(&Default::default());
 
-        let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor::default());
+        let dummy_lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         let flare_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -736,9 +939,69 @@ impl MainPipeline {
             dummy_blur_view,
             dummy_flare_view,
             dummy_lut_view,
-            lut_sampler,
+            dummy_lut_sampler,
             flare_sampler,
+            lut_cache: HashMap::new(),
         })
+    }
+
+    fn get_or_load_lut(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        path: &Path,
+    ) -> Result<(wgpu::TextureView, wgpu::Sampler), String> {
+        if let Some(cached) = self.lut_cache.get(path) {
+            return Ok((cached.view.clone(), cached.sampler.clone()));
+        }
+
+        let lut = parse_lut_file(path)?;
+        let mut rgba_lut_data_f16 = Vec::with_capacity(lut.data.len() / 3 * 4);
+        for chunk in lut.data.chunks_exact(3) {
+            rgba_lut_data_f16.push(f16::from_f32(chunk[0]));
+            rgba_lut_data_f16.push(f16::from_f32(chunk[1]));
+            rgba_lut_data_f16.push(f16::from_f32(chunk[2]));
+            rgba_lut_data_f16.push(f16::ONE);
+        }
+
+        let lut_texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some("RapidRAW LUT 3D Texture"),
+                size: wgpu::Extent3d {
+                    width: lut.size,
+                    height: lut.size,
+                    depth_or_array_layers: lut.size,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::MipMajor,
+            bytemuck::cast_slice(&rgba_lut_data_f16),
+        );
+        let view = lut_texture.create_view(&Default::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        self.lut_cache.insert(
+            path.to_path_buf(),
+            CachedLut {
+                view: view.clone(),
+                sampler: sampler.clone(),
+            },
+        );
+
+        Ok((view, sampler))
     }
 
     fn render(
@@ -833,8 +1096,22 @@ impl MainPipeline {
         });
         let structure_blur_view = structure_blur_texture.create_view(&Default::default());
 
-        let all_adjustments = build_all_adjustments(adjustments, is_raw);
+        let has_lut = adjustments
+            .lut_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty());
+        let all_adjustments = build_all_adjustments(adjustments, is_raw, has_lut);
         queue.write_buffer(&self.adjustments_buffer, 0, bytemuck::bytes_of(&all_adjustments));
+
+        let (lut_view, lut_sampler) = if let Some(path) = adjustments
+            .lut_path
+            .as_deref()
+            .filter(|path| !path.trim().is_empty())
+        {
+            self.get_or_load_lut(device, queue, Path::new(path))?
+        } else {
+            (self.dummy_lut_view.clone(), self.dummy_lut_sampler.clone())
+        };
 
         let run_blur = |radius: u32, output_view: &wgpu::TextureView| -> bool {
             if radius == 0 {
@@ -1132,11 +1409,11 @@ impl MainPipeline {
 
         entries.push(wgpu::BindGroupEntry {
             binding: 11,
-            resource: wgpu::BindingResource::TextureView(&self.dummy_lut_view),
+            resource: wgpu::BindingResource::TextureView(&lut_view),
         });
         entries.push(wgpu::BindGroupEntry {
             binding: 12,
-            resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
+            resource: wgpu::BindingResource::Sampler(&lut_sampler),
         });
 
         entries.push(wgpu::BindGroupEntry {
@@ -1519,7 +1796,7 @@ struct AllAdjustments {
     mask_atlas_cols: u32,
 }
 
-fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdjustments {
+fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool, has_lut: bool) -> AllAdjustments {
     let (pipe_to_rendering, rendering_to_pipe) = calculate_agx_matrices();
     let mut all = AllAdjustments::default();
     let (luma_curve, luma_curve_count) = convert_curve_points(&adjustments.curves.luma);
@@ -1556,6 +1833,8 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     all.global.grain_size = adjustments.grain_size / 50.0;
     all.global.grain_roughness = adjustments.grain_roughness / 100.0;
     all.global.is_raw_image = if is_raw { 1 } else { 0 };
+    all.global.has_lut = if has_lut { 1 } else { 0 };
+    all.global.lut_intensity = adjustments.lut_intensity / 100.0;
     all.global.tonemapper_mode = if matches!(adjustments.tone_mapper, ToneMapper::AgX) {
         1
     } else {
