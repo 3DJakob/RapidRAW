@@ -155,6 +155,16 @@ pub struct BasicAdjustments {
     pub centre: f32,
     pub chromatic_aberration_red_cyan: f32,
     pub chromatic_aberration_blue_yellow: f32,
+    pub vignette_amount: f32,
+    pub vignette_midpoint: f32,
+    pub vignette_roundness: f32,
+    pub vignette_feather: f32,
+    pub grain_amount: f32,
+    pub grain_size: f32,
+    pub grain_roughness: f32,
+    pub glow_amount: f32,
+    pub halation_amount: f32,
+    pub flare_amount: f32,
     pub tone_mapper: ToneMapper,
     pub hsl: HslSettings,
     pub color_grading: ColorGradingSettingsUi,
@@ -185,6 +195,16 @@ impl Default for BasicAdjustments {
             centre: 0.0,
             chromatic_aberration_red_cyan: 0.0,
             chromatic_aberration_blue_yellow: 0.0,
+            vignette_amount: 0.0,
+            vignette_midpoint: 50.0,
+            vignette_roundness: 0.0,
+            vignette_feather: 50.0,
+            grain_amount: 0.0,
+            grain_size: 25.0,
+            grain_roughness: 50.0,
+            glow_amount: 0.0,
+            halation_amount: 0.0,
+            flare_amount: 0.0,
             tone_mapper: ToneMapper::AgX,
             hsl: HslSettings::default(),
             color_grading: ColorGradingSettingsUi::default(),
@@ -265,6 +285,14 @@ struct MainPipeline {
     h_blur_pipeline: wgpu::ComputePipeline,
     v_blur_pipeline: wgpu::ComputePipeline,
     blur_params_buffer: wgpu::Buffer,
+    flare_bgl_0: wgpu::BindGroupLayout,
+    flare_bgl_1: wgpu::BindGroupLayout,
+    flare_threshold_pipeline: wgpu::ComputePipeline,
+    flare_ghosts_pipeline: wgpu::ComputePipeline,
+    flare_params_buffer: wgpu::Buffer,
+    flare_threshold_view: wgpu::TextureView,
+    flare_ghosts_view: wgpu::TextureView,
+    flare_final_view: wgpu::TextureView,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     adjustments_buffer: wgpu::Buffer,
@@ -280,6 +308,7 @@ impl MainPipeline {
     fn new(context: &GpuContext) -> Result<Self, String> {
         let device = &context.device;
         const MAX_MASKS: u32 = 8;
+        const FLARE_MAP_SIZE: u32 = 512;
 
         let blur_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RapidRAW Blur Shader"),
@@ -354,6 +383,148 @@ impl MainPipeline {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+
+        let flare_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("RapidRAW Flare Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../src-tauri/src/shaders/flare.wgsl").into(),
+            ),
+        });
+
+        let flare_bgl_0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RapidRAW Flare BGL 0"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let flare_bgl_1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("RapidRAW Flare BGL 1"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let flare_threshold_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RapidRAW Flare Threshold Layout"),
+            bind_group_layouts: &[&flare_bgl_0],
+            immediate_size: 0,
+        });
+        let flare_ghosts_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("RapidRAW Flare Ghosts Layout"),
+            bind_group_layouts: &[&flare_bgl_0, &flare_bgl_1],
+            immediate_size: 0,
+        });
+
+        let flare_threshold_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("RapidRAW Flare Threshold Pipeline"),
+                layout: Some(&flare_threshold_layout),
+                module: &flare_shader,
+                entry_point: Some("threshold_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let flare_ghosts_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("RapidRAW Flare Ghosts Pipeline"),
+                layout: Some(&flare_ghosts_layout),
+                module: &flare_shader,
+                entry_point: Some("ghosts_main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        let flare_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("RapidRAW Flare Params"),
+            size: std::mem::size_of::<FlareParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flare_tex_desc = wgpu::TextureDescriptor {
+            label: Some("RapidRAW Flare Texture"),
+            size: wgpu::Extent3d {
+                width: FLARE_MAP_SIZE,
+                height: FLARE_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        };
+        let flare_threshold_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Flare Threshold Texture"),
+            ..flare_tex_desc
+        });
+        let flare_threshold_view = flare_threshold_texture.create_view(&Default::default());
+        let flare_ghosts_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Flare Ghosts Texture"),
+            ..flare_tex_desc
+        });
+        let flare_ghosts_view = flare_ghosts_texture.create_view(&Default::default());
+        let flare_final_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RapidRAW Flare Final Texture"),
+            ..flare_tex_desc
+        });
+        let flare_final_view = flare_final_texture.create_view(&Default::default());
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RapidRAW Main Shader"),
@@ -550,6 +721,14 @@ impl MainPipeline {
             h_blur_pipeline,
             v_blur_pipeline,
             blur_params_buffer,
+            flare_bgl_0,
+            flare_bgl_1,
+            flare_threshold_pipeline,
+            flare_ghosts_pipeline,
+            flare_params_buffer,
+            flare_threshold_view,
+            flare_ghosts_view,
+            flare_final_view,
             bind_group_layout,
             pipeline,
             adjustments_buffer,
@@ -744,6 +923,189 @@ impl MainPipeline {
         let did_create_tonal_blur = run_blur(4, &tonal_blur_view);
         let did_create_clarity_blur = run_blur(8, &clarity_blur_view);
         let did_create_structure_blur = run_blur(40, &structure_blur_view);
+        let use_flare = if adjustments.flare_amount > 0.0 {
+            const FLARE_MAP_SIZE: u32 = 512;
+
+            let aspect_ratio = if height > 0 {
+                width as f32 / height as f32
+            } else {
+                1.0
+            };
+            let flare_params = FlareParams {
+                amount: all_adjustments.global.flare_amount,
+                is_raw: all_adjustments.global.is_raw_image,
+                exposure: all_adjustments.global.exposure,
+                brightness: all_adjustments.global.brightness,
+                contrast: all_adjustments.global.contrast,
+                whites: all_adjustments.global.whites,
+                aspect_ratio,
+                _pad: 0.0,
+            };
+            queue.write_buffer(&self.flare_params_buffer, 0, bytemuck::bytes_of(&flare_params));
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("RapidRAW Flare Encoder"),
+            });
+
+            let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW Flare BG0"),
+                layout: &self.flare_bgl_0,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_threshold_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.flare_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.flare_sampler),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW Flare Threshold Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.flare_threshold_pipeline);
+                cpass.set_bind_group(0, &bg0, &[]);
+                cpass.dispatch_workgroups(FLARE_MAP_SIZE / 16, FLARE_MAP_SIZE / 16, 1);
+            }
+
+            let bg0_ghosts = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW Flare Ghosts BG0"),
+                layout: &self.flare_bgl_0,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&input_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_final_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.flare_params_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.flare_sampler),
+                    },
+                ],
+            });
+
+            let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW Flare Ghosts BG1"),
+                layout: &self.flare_bgl_1,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_threshold_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_ghosts_view),
+                    },
+                ],
+            });
+
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW Flare Ghosts Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.flare_ghosts_pipeline);
+                cpass.set_bind_group(0, &bg0_ghosts, &[]);
+                cpass.set_bind_group(1, &bg1, &[]);
+                cpass.dispatch_workgroups(FLARE_MAP_SIZE / 16, FLARE_MAP_SIZE / 16, 1);
+            }
+
+            queue.submit(Some(encoder.finish()));
+
+            let params = BlurParams {
+                radius: 12,
+                tile_offset_x: 0,
+                tile_offset_y: 0,
+                input_width: FLARE_MAP_SIZE,
+                input_height: FLARE_MAP_SIZE,
+                _pad1: 0,
+                _pad2: 0,
+                _pad3: 0,
+            };
+            queue.write_buffer(&self.blur_params_buffer, 0, bytemuck::bytes_of(&params));
+
+            let mut blur_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("RapidRAW Flare Blur Encoder"),
+            });
+            let h_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW Flare Blur H"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_ghosts_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_threshold_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.blur_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut cpass = blur_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW Flare Blur H Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.h_blur_pipeline);
+                cpass.set_bind_group(0, &h_bg, &[]);
+                cpass.dispatch_workgroups(FLARE_MAP_SIZE / 256 + 1, FLARE_MAP_SIZE, 1);
+            }
+
+            let v_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("RapidRAW Flare Blur V"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_threshold_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&self.flare_final_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.blur_params_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut cpass = blur_encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("RapidRAW Flare Blur V Pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.v_blur_pipeline);
+                cpass.set_bind_group(0, &v_bg, &[]);
+                cpass.dispatch_workgroups(FLARE_MAP_SIZE, FLARE_MAP_SIZE / 256 + 1, 1);
+            }
+            queue.submit(Some(blur_encoder.finish()));
+            true
+        } else {
+            false
+        };
 
         const MAX_MASKS: usize = 8;
         let mut entries = vec![
@@ -811,7 +1173,11 @@ impl MainPipeline {
         });
         entries.push(wgpu::BindGroupEntry {
             binding: 17,
-            resource: wgpu::BindingResource::TextureView(&self.dummy_flare_view),
+            resource: wgpu::BindingResource::TextureView(if use_flare {
+                &self.flare_final_view
+            } else {
+                &self.dummy_flare_view
+            }),
         });
         entries.push(wgpu::BindGroupEntry {
             binding: 18,
@@ -953,6 +1319,19 @@ struct BlurParams {
     _pad1: u32,
     _pad2: u32,
     _pad3: u32,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
+#[repr(C)]
+struct FlareParams {
+    amount: f32,
+    is_raw: u32,
+    exposure: f32,
+    brightness: f32,
+    contrast: f32,
+    whites: f32,
+    aspect_ratio: f32,
+    _pad: f32,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Pod, Zeroable, Default)]
@@ -1169,6 +1548,13 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
         adjustments.chromatic_aberration_red_cyan / 10000.0;
     all.global.chromatic_aberration_blue_yellow =
         adjustments.chromatic_aberration_blue_yellow / 10000.0;
+    all.global.vignette_amount = adjustments.vignette_amount / 100.0;
+    all.global.vignette_midpoint = adjustments.vignette_midpoint / 100.0;
+    all.global.vignette_roundness = adjustments.vignette_roundness / 100.0;
+    all.global.vignette_feather = adjustments.vignette_feather / 100.0;
+    all.global.grain_amount = adjustments.grain_amount / 200.0;
+    all.global.grain_size = adjustments.grain_size / 50.0;
+    all.global.grain_roughness = adjustments.grain_roughness / 100.0;
     all.global.is_raw_image = if is_raw { 1 } else { 0 };
     all.global.tonemapper_mode = if matches!(adjustments.tone_mapper, ToneMapper::AgX) {
         1
@@ -1201,6 +1587,9 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     all.global.red_curve_count = red_curve_count;
     all.global.green_curve_count = green_curve_count;
     all.global.blue_curve_count = blue_curve_count;
+    all.global.glow_amount = adjustments.glow_amount / 100.0;
+    all.global.halation_amount = adjustments.halation_amount / 100.0;
+    all.global.flare_amount = adjustments.flare_amount / 100.0;
     all
 }
 

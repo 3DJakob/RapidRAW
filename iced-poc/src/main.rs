@@ -48,6 +48,7 @@ enum Message {
     ToggleCurvesCard,
     ToggleColorCard,
     ToggleDetailsCard,
+    ToggleEffectsCard,
     ExposureChanged(f32),
     BrightnessChanged(f32),
     ContrastChanged(f32),
@@ -66,6 +67,16 @@ enum Message {
     CentreChanged(f32),
     ChromaticAberrationRedCyanChanged(f32),
     ChromaticAberrationBlueYellowChanged(f32),
+    GlowAmountChanged(f32),
+    HalationAmountChanged(f32),
+    FlareAmountChanged(f32),
+    VignetteAmountChanged(f32),
+    VignetteMidpointChanged(f32),
+    VignetteRoundnessChanged(f32),
+    VignetteFeatherChanged(f32),
+    GrainAmountChanged(f32),
+    GrainSizeChanged(f32),
+    GrainRoughnessChanged(f32),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
@@ -81,6 +92,7 @@ enum Message {
     ColorGradingBalanceChanged(f32),
     ResetColorAdjustments,
     ResetDetailsAdjustments,
+    ResetEffectsAdjustments,
     CommitPreviewRender,
     PreviewRendered {
         generation: u64,
@@ -98,6 +110,7 @@ struct App {
     curves_card: CardAnimation,
     color_card: CardAnimation,
     details_card: CardAnimation,
+    effects_card: CardAnimation,
     active_curve_channel: CurveChannel,
     active_hsl_band: HslBand,
     active_color_grading_zone: ColorGradingZone,
@@ -258,6 +271,10 @@ impl App {
                     expanded: false,
                     progress: 0.0,
                 },
+                effects_card: CardAnimation {
+                    expanded: false,
+                    progress: 0.0,
+                },
                 active_curve_channel: CurveChannel::Luma,
                 active_hsl_band: HslBand::Reds,
                 active_color_grading_zone: ColorGradingZone::Midtones,
@@ -362,6 +379,7 @@ impl App {
                 step_card_animation(&mut self.curves_card);
                 step_card_animation(&mut self.color_card);
                 step_card_animation(&mut self.details_card);
+                step_card_animation(&mut self.effects_card);
             }
             Message::ToggleBasicCard => {
                 self.basic_card.expanded = !self.basic_card.expanded;
@@ -374,6 +392,9 @@ impl App {
             }
             Message::ToggleDetailsCard => {
                 self.details_card.expanded = !self.details_card.expanded;
+            }
+            Message::ToggleEffectsCard => {
+                self.effects_card.expanded = !self.effects_card.expanded;
             }
             Message::SelectImage(index) => {
                 if index < self.samples.len() {
@@ -482,6 +503,56 @@ impl App {
                 self.update_selected_adjustments(|adjustments| {
                     adjustments.chromatic_aberration_blue_yellow = value;
                 });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::GlowAmountChanged(value) => {
+                self.basic_adjustments.glow_amount = value;
+                self.update_selected_adjustments(|adjustments| adjustments.glow_amount = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::HalationAmountChanged(value) => {
+                self.basic_adjustments.halation_amount = value;
+                self.update_selected_adjustments(|adjustments| adjustments.halation_amount = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::FlareAmountChanged(value) => {
+                self.basic_adjustments.flare_amount = value;
+                self.update_selected_adjustments(|adjustments| adjustments.flare_amount = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::VignetteAmountChanged(value) => {
+                self.basic_adjustments.vignette_amount = value;
+                self.update_selected_adjustments(|adjustments| adjustments.vignette_amount = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::VignetteMidpointChanged(value) => {
+                self.basic_adjustments.vignette_midpoint = value;
+                self.update_selected_adjustments(|adjustments| adjustments.vignette_midpoint = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::VignetteRoundnessChanged(value) => {
+                self.basic_adjustments.vignette_roundness = value;
+                self.update_selected_adjustments(|adjustments| adjustments.vignette_roundness = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::VignetteFeatherChanged(value) => {
+                self.basic_adjustments.vignette_feather = value;
+                self.update_selected_adjustments(|adjustments| adjustments.vignette_feather = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::GrainAmountChanged(value) => {
+                self.basic_adjustments.grain_amount = value;
+                self.update_selected_adjustments(|adjustments| adjustments.grain_amount = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::GrainSizeChanged(value) => {
+                self.basic_adjustments.grain_size = value;
+                self.update_selected_adjustments(|adjustments| adjustments.grain_size = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::GrainRoughnessChanged(value) => {
+                self.basic_adjustments.grain_roughness = value;
+                self.update_selected_adjustments(|adjustments| adjustments.grain_roughness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ToneMapperChanged(value) => {
@@ -622,6 +693,31 @@ impl App {
                 });
                 return self.request_preview_render(PreviewQuality::Full);
             }
+            Message::ResetEffectsAdjustments => {
+                self.basic_adjustments.glow_amount = 0.0;
+                self.basic_adjustments.halation_amount = 0.0;
+                self.basic_adjustments.flare_amount = 0.0;
+                self.basic_adjustments.vignette_amount = 0.0;
+                self.basic_adjustments.vignette_midpoint = 50.0;
+                self.basic_adjustments.vignette_roundness = 0.0;
+                self.basic_adjustments.vignette_feather = 50.0;
+                self.basic_adjustments.grain_amount = 0.0;
+                self.basic_adjustments.grain_size = 25.0;
+                self.basic_adjustments.grain_roughness = 50.0;
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.glow_amount = 0.0;
+                    adjustments.halation_amount = 0.0;
+                    adjustments.flare_amount = 0.0;
+                    adjustments.vignette_amount = 0.0;
+                    adjustments.vignette_midpoint = 50.0;
+                    adjustments.vignette_roundness = 0.0;
+                    adjustments.vignette_feather = 50.0;
+                    adjustments.grain_amount = 0.0;
+                    adjustments.grain_size = 25.0;
+                    adjustments.grain_roughness = 50.0;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
             Message::CommitPreviewRender => {
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
@@ -658,6 +754,7 @@ impl App {
             || (self.curves_card.progress - if self.curves_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
             || (self.color_card.progress - if self.color_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
             || (self.details_card.progress - if self.details_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
+            || (self.effects_card.progress - if self.effects_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
     }
 
     fn update_selected_adjustments(
@@ -1220,11 +1317,115 @@ impl App {
         ]
         .spacing(14);
 
+        let effects_body = column![
+            row![
+                text("Creative effects, vignette, and grain")
+                    .size(14)
+                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                Space::with_width(Length::Fill),
+                icon_button("↺", Message::ResetEffectsAdjustments, "Reset effects adjustments"),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+            card_section(
+                "Creative",
+                column![
+                    basic_slider(
+                        "Glow",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.glow_amount,
+                        Message::GlowAmountChanged,
+                    ),
+                    basic_slider(
+                        "Halation",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.halation_amount,
+                        Message::HalationAmountChanged,
+                    ),
+                    basic_slider(
+                        "Light Flares",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.flare_amount,
+                        Message::FlareAmountChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Vignette",
+                column![
+                    basic_slider(
+                        "Amount",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.vignette_amount,
+                        Message::VignetteAmountChanged,
+                    ),
+                    basic_slider(
+                        "Midpoint",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.vignette_midpoint,
+                        Message::VignetteMidpointChanged,
+                    ),
+                    basic_slider(
+                        "Roundness",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.vignette_roundness,
+                        Message::VignetteRoundnessChanged,
+                    ),
+                    basic_slider(
+                        "Feather",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.vignette_feather,
+                        Message::VignetteFeatherChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Grain",
+                column![
+                    basic_slider(
+                        "Amount",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.grain_amount,
+                        Message::GrainAmountChanged,
+                    ),
+                    basic_slider(
+                        "Size",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.grain_size,
+                        Message::GrainSizeChanged,
+                    ),
+                    basic_slider(
+                        "Roughness",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.grain_roughness,
+                        Message::GrainRoughnessChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+        ]
+        .spacing(14);
+
         let controls = column![
             adjustment_card("Basic", self.basic_card, Message::ToggleBasicCard, basic_body.into(), 430.0),
             adjustment_card("Curves", self.curves_card, Message::ToggleCurvesCard, curves_body, 320.0),
             adjustment_card("Color", self.color_card, Message::ToggleColorCard, color_body.into(), 1180.0),
             adjustment_card("Details", self.details_card, Message::ToggleDetailsCard, details_body.into(), 620.0),
+            adjustment_card("Effects", self.effects_card, Message::ToggleEffectsCard, effects_body.into(), 700.0),
             text("Preview updates live for the selected image.")
                 .size(13)
                 .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
@@ -1620,6 +1821,31 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
             .get("chromaticAberrationBlueYellow")
             .and_then(Value::as_f64)
             .unwrap_or(0.0) as f32,
+        vignette_amount: value.get("vignetteAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        vignette_midpoint: value
+            .get("vignetteMidpoint")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0) as f32,
+        vignette_roundness: value
+            .get("vignetteRoundness")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        vignette_feather: value
+            .get("vignetteFeather")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0) as f32,
+        grain_amount: value.get("grainAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        grain_size: value.get("grainSize").and_then(Value::as_f64).unwrap_or(25.0) as f32,
+        grain_roughness: value
+            .get("grainRoughness")
+            .and_then(Value::as_f64)
+            .unwrap_or(50.0) as f32,
+        glow_amount: value.get("glowAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        halation_amount: value
+            .get("halationAmount")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        flare_amount: value.get("flareAmount").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         tone_mapper,
         hsl: hsl_from_value(value.get("hsl").unwrap_or(&Value::Null)),
         color_grading: color_grading_from_value(value.get("colorGrading").unwrap_or(&Value::Null)),
@@ -1652,6 +1878,16 @@ fn adjustments_to_value(adjustments: &BasicAdjustments) -> Value {
         "centré": adjustments.centre,
         "chromaticAberrationRedCyan": adjustments.chromatic_aberration_red_cyan,
         "chromaticAberrationBlueYellow": adjustments.chromatic_aberration_blue_yellow,
+        "vignetteAmount": adjustments.vignette_amount,
+        "vignetteMidpoint": adjustments.vignette_midpoint,
+        "vignetteRoundness": adjustments.vignette_roundness,
+        "vignetteFeather": adjustments.vignette_feather,
+        "grainAmount": adjustments.grain_amount,
+        "grainSize": adjustments.grain_size,
+        "grainRoughness": adjustments.grain_roughness,
+        "glowAmount": adjustments.glow_amount,
+        "halationAmount": adjustments.halation_amount,
+        "flareAmount": adjustments.flare_amount,
         "toneMapper": match adjustments.tone_mapper {
             ToneMapper::Basic => "basic",
             ToneMapper::AgX => "agx",
