@@ -97,6 +97,7 @@ enum Message {
     LutIntensityChanged(f32),
     HoverLut(Option<usize>),
     ApplyLutFromBrowser(usize),
+    SelectSidebarPage(SidebarPage),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
@@ -149,6 +150,7 @@ struct App {
     renderer: Option<RapidRawRenderer>,
     undo_stack: Vec<UndoEntry>,
     pending_drag_undo: Option<UndoEntry>,
+    sidebar_page: SidebarPage,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +168,12 @@ struct UndoChange {
 enum UndoBehavior {
     Immediate,
     Coalesced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarPage {
+    Adjustments,
+    Export,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,6 +235,8 @@ enum AppIcon {
     Check,
     ChevronDown,
     ChevronUp,
+    SlidersHorizontal,
+    Share,
     FolderOpen,
     RotateCcw,
     Star,
@@ -416,6 +426,7 @@ impl App {
             renderer,
             undo_stack: Vec::new(),
             pending_drag_undo: None,
+            sidebar_page: SidebarPage::Adjustments,
         };
 
         if let Some(sample) = app.samples.first() {
@@ -553,6 +564,9 @@ impl App {
             Message::ModifiersChanged(modifiers) => {
                 self.shift_pressed = modifiers.shift();
             }
+            Message::SelectSidebarPage(page) => {
+                self.sidebar_page = page;
+            }
             Message::SelectAllImages => {
                 self.finish_pending_drag_undo();
                 if self.route == Route::Editor && !self.samples.is_empty() {
@@ -561,8 +575,7 @@ impl App {
                     self.basic_adjustments = self.samples[0].adjustments.clone();
                     self.rendered_preview = None;
                     self.pending_preview_quality = None;
-                    self.status_message =
-                        Some(format!("Selected {} images.", self.samples.len()));
+                    self.status_message = Some(format!("Selected {} images.", self.samples.len()));
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
@@ -1522,7 +1535,7 @@ impl App {
 
         let editor_body = row![
             preview,
-            container(self.view_basic_panel())
+            container(self.view_right_panel())
                 .width(Length::Fixed(330.0))
                 .height(Length::Fill)
         ]
@@ -1681,7 +1694,73 @@ impl App {
         .into()
     }
 
-    fn view_basic_panel(&self) -> Element<'_, Message> {
+    fn view_right_panel(&self) -> Element<'_, Message> {
+        let top_tabs = row![
+            sidebar_tab_button(
+                AppIcon::SlidersHorizontal,
+                self.sidebar_page == SidebarPage::Adjustments,
+                Message::SelectSidebarPage(SidebarPage::Adjustments),
+                "Adjustments",
+            ),
+            sidebar_tab_button(
+                AppIcon::Share,
+                self.sidebar_page == SidebarPage::Export,
+                Message::SelectSidebarPage(SidebarPage::Export),
+                "Export",
+            ),
+        ]
+        .spacing(APP_SPACING);
+
+        let divider = container(Space::with_height(Length::Fixed(3.0)))
+            .width(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(Color::from_rgb8(0x12, 0x17, 0x22))),
+                ..container::Style::default()
+            });
+
+        let page_content: Element<'_, Message> = match self.sidebar_page {
+            SidebarPage::Adjustments => self.view_adjustments_page(),
+            SidebarPage::Export => container(
+                text("Export page coming next.")
+                    .size(14)
+                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+            )
+            .padding([20, 14])
+            .width(Length::Fill)
+            .into(),
+        };
+
+        let scroll_content: Element<'_, Message> = match self.sidebar_page {
+            SidebarPage::Adjustments => scrollable(page_content)
+                .direction(scrollable::Direction::Vertical(
+                    scrollable::Scrollbar::new()
+                        .width(4)
+                        .margin(0)
+                        .scroller_width(4),
+                ))
+                .style(discrete_scrollbar_style)
+                .height(Length::Fill)
+                .into(),
+            SidebarPage::Export => container(page_content).height(Length::Fill).into(),
+        };
+
+        container(
+            column![
+                container(top_tabs).padding([14, 14]),
+                divider,
+                container(scroll_content)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            ]
+            .height(Length::Fill)
+            .spacing(0),
+        )
+        .height(Length::Fill)
+        .style(panel_style)
+        .into()
+    }
+
+    fn view_adjustments_page(&self) -> Element<'_, Message> {
         let basic_body = column![
             row![
                 Space::with_width(Length::Fill),
@@ -2066,7 +2145,11 @@ impl App {
                                 .unwrap_or("Select LUT"),
                             self.basic_adjustments.lut_name.is_some(),
                         ),
-                        icon_button(AppIcon::FolderOpen, Message::SelectLutFolder, "Choose LUT folder"),
+                        icon_button(
+                            AppIcon::FolderOpen,
+                            Message::SelectLutFolder,
+                            "Choose LUT folder"
+                        ),
                         if self.basic_adjustments.lut_name.is_some() {
                             icon_button(AppIcon::X, Message::ClearLut, "Clear LUT")
                         } else {
@@ -2211,23 +2294,10 @@ impl App {
         ]
         .spacing(16);
 
-        container(
-            scrollable(
-                container(controls)
-                    .padding([20, 14])
-                    .width(Length::Fill)
-            )
-                .direction(scrollable::Direction::Vertical(
-                    scrollable::Scrollbar::new()
-                        .width(4)
-                        .margin(0)
-                        .scroller_width(4),
-                ))
-                .style(discrete_scrollbar_style),
-        )
-        .height(Length::Fill)
-        .style(panel_style)
-        .into()
+        container(controls)
+            .padding([20, 14])
+            .width(Length::Fill)
+            .into()
     }
 
     fn request_preview_render(&mut self, quality: PreviewQuality) -> Task<Message> {
@@ -3484,8 +3554,7 @@ fn adjustment_card<'a>(
     container(
         column![
             header,
-            container(body_content)
-                .padding(if is_collapsed { 0 } else { 16 })
+            container(body_content).padding(if is_collapsed { 0 } else { 16 })
         ]
         .spacing(body_spacing),
     )
@@ -3512,6 +3581,8 @@ fn lucide_icon(icon: AppIcon) -> LucideIcon {
         AppIcon::Check => LucideIcon::Check,
         AppIcon::ChevronDown => LucideIcon::ChevronDown,
         AppIcon::ChevronUp => LucideIcon::ChevronUp,
+        AppIcon::SlidersHorizontal => LucideIcon::SlidersHorizontal,
+        AppIcon::Share => LucideIcon::Share,
         AppIcon::FolderOpen => LucideIcon::FolderOpen,
         AppIcon::RotateCcw => LucideIcon::Undo2,
         AppIcon::Star => LucideIcon::Star,
@@ -3519,30 +3590,82 @@ fn lucide_icon(icon: AppIcon) -> LucideIcon {
     }
 }
 
-fn icon_button<'a>(icon: AppIcon, message: Message, _title: &'a str) -> Element<'a, Message> {
-    button(
+fn sidebar_tab_button<'a>(
+    icon: AppIcon,
+    active: bool,
+    message: Message,
+    tip: &'a str,
+) -> Element<'a, Message> {
+    let button = button(
         container(app_icon(
             icon,
             16.0,
-            Color::from_rgb8(0xe2, 0xe8, 0xf0),
+            if active {
+                Color::WHITE
+            } else {
+                Color::from_rgb8(0xa8, 0xb2, 0xc8)
+            },
         ))
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(iced::alignment::Horizontal::Center)
         .align_y(iced::alignment::Vertical::Center),
     )
-        .width(Length::Fixed(34.0))
-        .height(Length::Fixed(34.0))
-        .padding(0)
-        .style(move |theme, status| {
-            let mut style = iced::widget::button::secondary(theme, status);
-            style.background = Some(Background::Color(Color::from_rgb8(0x21, 0x28, 0x35)));
-            style.text_color = Color::from_rgb8(0xe2, 0xe8, 0xf0);
-            style.border.radius = 999.0.into();
-            style
-        })
-        .on_press(message)
-        .into()
+    .width(Length::Fixed(36.0))
+    .height(Length::Fixed(36.0))
+    .padding(0)
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(if active {
+            Color::from_rgb8(0x24, 0x2d, 0x3c)
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => Color::from_rgb8(0x1d, 0x24, 0x31),
+                _ => Color::TRANSPARENT,
+            }
+        }));
+        style.border.radius = 12.0.into();
+        style.text_color = Color::WHITE;
+        style
+    })
+    .on_press(message);
+
+    tooltip(
+        button,
+        container(text(tip).size(12).color(Color::from_rgb8(0xe2, 0xe8, 0xf0)))
+            .padding([6, 10])
+            .style(|_| container::Style {
+                text_color: Some(Color::WHITE),
+                background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+                border: Border::default().rounded(10.0),
+                ..container::Style::default()
+            }),
+        tooltip::Position::Bottom,
+    )
+    .gap(8)
+    .into()
+}
+
+fn icon_button<'a>(icon: AppIcon, message: Message, _title: &'a str) -> Element<'a, Message> {
+    button(
+        container(app_icon(icon, 16.0, Color::from_rgb8(0xe2, 0xe8, 0xf0)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center)
+            .align_y(iced::alignment::Vertical::Center),
+    )
+    .width(Length::Fixed(34.0))
+    .height(Length::Fixed(34.0))
+    .padding(0)
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(Color::from_rgb8(0x21, 0x28, 0x35)));
+        style.text_color = Color::from_rgb8(0xe2, 0xe8, 0xf0);
+        style.border.radius = 999.0.into();
+        style
+    })
+    .on_press(message)
+    .into()
 }
 
 fn lut_picker_button<'a>(label: &'a str, has_lut: bool) -> Element<'a, Message> {
@@ -3787,12 +3910,12 @@ fn color_grading_wheel_panel<'a>(
     container(content).width(Length::Fill).into()
 }
 
-fn top_bar_icon_button<'a>(icon: AppIcon, message: Option<Message>, tip: &'a str) -> Element<'a, Message> {
-    let button = button(app_icon(
-        icon,
-        18.0,
-        Color::from_rgb8(0xe2, 0xe8, 0xf0),
-    ))
+fn top_bar_icon_button<'a>(
+    icon: AppIcon,
+    message: Option<Message>,
+    tip: &'a str,
+) -> Element<'a, Message> {
+    let button = button(app_icon(icon, 18.0, Color::from_rgb8(0xe2, 0xe8, 0xf0)))
         .padding([10, 12])
         .style(|theme, status| {
             let mut style = iced::widget::button::secondary(theme, status);
@@ -3872,9 +3995,7 @@ fn is_error_status(status: &str) -> bool {
 
 fn is_info_status(status: &str) -> bool {
     let lower = status.to_ascii_lowercase();
-    lower.starts_with("loading ")
-        || lower.starts_with("rendering ")
-        || lower.starts_with("loaded ")
+    lower.starts_with("loading ") || lower.starts_with("rendering ") || lower.starts_with("loaded ")
 }
 
 fn step_card_animation(card: &mut CardAnimation) {
