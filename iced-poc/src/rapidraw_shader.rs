@@ -17,6 +17,96 @@ pub struct CurvePoint {
     pub y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HueSatLum {
+    pub hue: f32,
+    pub saturation: f32,
+    pub luminance: f32,
+}
+
+impl Default for HueSatLum {
+    fn default() -> Self {
+        Self {
+            hue: 0.0,
+            saturation: 0.0,
+            luminance: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct HslSettings {
+    pub reds: HueSatLum,
+    pub oranges: HueSatLum,
+    pub yellows: HueSatLum,
+    pub greens: HueSatLum,
+    pub aquas: HueSatLum,
+    pub blues: HueSatLum,
+    pub purples: HueSatLum,
+    pub magentas: HueSatLum,
+}
+
+impl Default for HslSettings {
+    fn default() -> Self {
+        Self {
+            reds: HueSatLum::default(),
+            oranges: HueSatLum::default(),
+            yellows: HueSatLum::default(),
+            greens: HueSatLum::default(),
+            aquas: HueSatLum::default(),
+            blues: HueSatLum::default(),
+            purples: HueSatLum::default(),
+            magentas: HueSatLum::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ColorGradingSettingsUi {
+    pub shadows: HueSatLum,
+    pub midtones: HueSatLum,
+    pub highlights: HueSatLum,
+    pub blending: f32,
+    pub balance: f32,
+}
+
+impl Default for ColorGradingSettingsUi {
+    fn default() -> Self {
+        Self {
+            shadows: HueSatLum::default(),
+            midtones: HueSatLum::default(),
+            highlights: HueSatLum::default(),
+            blending: 50.0,
+            balance: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ColorCalibrationSettingsUi {
+    pub shadows_tint: f32,
+    pub red_hue: f32,
+    pub red_saturation: f32,
+    pub green_hue: f32,
+    pub green_saturation: f32,
+    pub blue_hue: f32,
+    pub blue_saturation: f32,
+}
+
+impl Default for ColorCalibrationSettingsUi {
+    fn default() -> Self {
+        Self {
+            shadows_tint: 0.0,
+            red_hue: 0.0,
+            red_saturation: 0.0,
+            green_hue: 0.0,
+            green_saturation: 0.0,
+            blue_hue: 0.0,
+            blue_saturation: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CurvesSettings {
     pub luma: Vec<CurvePoint>,
@@ -52,7 +142,14 @@ pub struct BasicAdjustments {
     pub shadows: f32,
     pub whites: f32,
     pub blacks: f32,
+    pub saturation: f32,
+    pub temperature: f32,
+    pub tint: f32,
+    pub vibrance: f32,
     pub tone_mapper: ToneMapper,
+    pub hsl: HslSettings,
+    pub color_grading: ColorGradingSettingsUi,
+    pub color_calibration: ColorCalibrationSettingsUi,
     pub curves: CurvesSettings,
 }
 
@@ -66,7 +163,14 @@ impl Default for BasicAdjustments {
             shadows: 0.0,
             whites: 0.0,
             blacks: 0.0,
+            saturation: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            vibrance: 0.0,
             tone_mapper: ToneMapper::AgX,
+            hsl: HslSettings::default(),
+            color_grading: ColorGradingSettingsUi::default(),
+            color_calibration: ColorCalibrationSettingsUi::default(),
             curves: CurvesSettings::default(),
         }
     }
@@ -783,6 +887,10 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     all.global.shadows = adjustments.shadows / 100.0;
     all.global.whites = adjustments.whites / 30.0;
     all.global.blacks = adjustments.blacks / 60.0;
+    all.global.saturation = adjustments.saturation / 100.0;
+    all.global.temperature = adjustments.temperature / 25.0;
+    all.global.tint = adjustments.tint / 100.0;
+    all.global.vibrance = adjustments.vibrance / 100.0;
     all.global.is_raw_image = if is_raw { 1 } else { 0 };
     all.global.tonemapper_mode = if matches!(adjustments.tone_mapper, ToneMapper::AgX) {
         1
@@ -791,7 +899,22 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     };
     all.global.agx_pipe_to_rendering_matrix = pipe_to_rendering;
     all.global.agx_rendering_to_pipe_matrix = rendering_to_pipe;
-    all.global.color_grading_blending = 0.5;
+    all.global.color_grading_shadows = convert_color_grade(adjustments.color_grading.shadows);
+    all.global.color_grading_midtones = convert_color_grade(adjustments.color_grading.midtones);
+    all.global.color_grading_highlights = convert_color_grade(adjustments.color_grading.highlights);
+    all.global.color_grading_blending = adjustments.color_grading.blending / 100.0;
+    all.global.color_grading_balance = adjustments.color_grading.balance / 200.0;
+    all.global.color_calibration = ColorCalibrationSettings {
+        shadows_tint: adjustments.color_calibration.shadows_tint / 400.0,
+        red_hue: adjustments.color_calibration.red_hue / 400.0,
+        red_saturation: adjustments.color_calibration.red_saturation / 120.0,
+        green_hue: adjustments.color_calibration.green_hue / 400.0,
+        green_saturation: adjustments.color_calibration.green_saturation / 120.0,
+        blue_hue: adjustments.color_calibration.blue_hue / 400.0,
+        blue_saturation: adjustments.color_calibration.blue_saturation / 120.0,
+        _pad1: 0.0,
+    };
+    all.global.hsl = convert_hsl_settings(&adjustments.hsl);
     all.global.luma_curve = luma_curve;
     all.global.red_curve = red_curve;
     all.global.green_curve = green_curve;
@@ -801,6 +924,37 @@ fn build_all_adjustments(adjustments: &BasicAdjustments, is_raw: bool) -> AllAdj
     all.global.green_curve_count = green_curve_count;
     all.global.blue_curve_count = blue_curve_count;
     all
+}
+
+fn convert_color_grade(value: HueSatLum) -> ColorGradeSettings {
+    ColorGradeSettings {
+        hue: value.hue,
+        saturation: value.saturation / 500.0,
+        luminance: value.luminance / 500.0,
+        _pad: 0.0,
+    }
+}
+
+fn convert_hsl_settings(value: &HslSettings) -> [HslColor; 8] {
+    [
+        convert_hsl(value.reds),
+        convert_hsl(value.oranges),
+        convert_hsl(value.yellows),
+        convert_hsl(value.greens),
+        convert_hsl(value.aquas),
+        convert_hsl(value.blues),
+        convert_hsl(value.purples),
+        convert_hsl(value.magentas),
+    ]
+}
+
+fn convert_hsl(value: HueSatLum) -> HslColor {
+    HslColor {
+        hue: value.hue * 0.3,
+        saturation: value.saturation / 100.0,
+        luminance: value.luminance / 100.0,
+        _pad: 0.0,
+    }
 }
 
 fn convert_curve_points(points: &[CurvePoint]) -> ([Point; 16], u32) {

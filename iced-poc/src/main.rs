@@ -1,7 +1,7 @@
 mod rapidraw_shader;
 
 use iced::widget::{
-    Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, text, tooltip,
+    Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, tooltip,
 };
 use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme, application, mouse, window};
 use ::image::{DynamicImage, GenericImageView, RgbImage, imageops::FilterType, open as open_image};
@@ -11,7 +11,8 @@ use rawler::{
     rawsource::RawSource,
 };
 use rapidraw_shader::{
-    BasicAdjustments, CurvePoint, CurvesSettings, RapidRawRenderer, ToneMapper, default_curve_points,
+    BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint, CurvesSettings,
+    HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -45,6 +46,7 @@ enum Message {
     AnimationFrame(Instant),
     ToggleBasicCard,
     ToggleCurvesCard,
+    ToggleColorCard,
     ExposureChanged(f32),
     BrightnessChanged(f32),
     ContrastChanged(f32),
@@ -52,11 +54,24 @@ enum Message {
     ShadowsChanged(f32),
     WhitesChanged(f32),
     BlacksChanged(f32),
+    TemperatureChanged(f32),
+    TintChanged(f32),
+    VibranceChanged(f32),
+    SaturationChanged(f32),
     ToneMapperChanged(ToneMapper),
     ActiveCurveChannelChanged(CurveChannel),
     CurveChanged(CurveChannel, Vec<CurvePoint>),
     ResetCurveChannel(CurveChannel),
     ResetBasicAdjustments,
+    ActiveHslBandChanged(HslBand),
+    HslHueChanged(f32),
+    HslSaturationChanged(f32),
+    HslLuminanceChanged(f32),
+    ColorGradingWheelChanged(ColorGradingZone, HueSatLum),
+    ColorGradingZoneLuminanceChanged(ColorGradingZone, f32),
+    ColorGradingBlendingChanged(f32),
+    ColorGradingBalanceChanged(f32),
+    ResetColorAdjustments,
     CommitPreviewRender,
     PreviewRendered {
         generation: u64,
@@ -72,7 +87,10 @@ struct App {
     shift_pressed: bool,
     basic_card: CardAnimation,
     curves_card: CardAnimation,
+    color_card: CardAnimation,
     active_curve_channel: CurveChannel,
+    active_hsl_band: HslBand,
+    active_color_grading_zone: ColorGradingZone,
     current_folder: Option<PathBuf>,
     is_loading: bool,
     status_message: Option<String>,
@@ -149,6 +167,25 @@ enum CurveChannel {
     Blue,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HslBand {
+    Reds,
+    Oranges,
+    Yellows,
+    Greens,
+    Aquas,
+    Blues,
+    Purples,
+    Magentas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColorGradingZone {
+    Shadows,
+    Midtones,
+    Highlights,
+}
+
 #[derive(Debug, Clone)]
 struct HistogramData {
     luma: [u32; 256],
@@ -160,6 +197,11 @@ struct HistogramData {
 #[derive(Debug, Default)]
 struct CurveEditorState {
     dragging_index: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct ColorWheelState {
+    dragging: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,7 +240,13 @@ impl App {
                     expanded: false,
                     progress: 0.0,
                 },
+                color_card: CardAnimation {
+                    expanded: false,
+                    progress: 0.0,
+                },
                 active_curve_channel: CurveChannel::Luma,
+                active_hsl_band: HslBand::Reds,
+                active_color_grading_zone: ColorGradingZone::Midtones,
                 current_folder: None,
                 is_loading: false,
                 status_message,
@@ -298,12 +346,16 @@ impl App {
             Message::AnimationFrame(_instant) => {
                 step_card_animation(&mut self.basic_card);
                 step_card_animation(&mut self.curves_card);
+                step_card_animation(&mut self.color_card);
             }
             Message::ToggleBasicCard => {
                 self.basic_card.expanded = !self.basic_card.expanded;
             }
             Message::ToggleCurvesCard => {
                 self.curves_card.expanded = !self.curves_card.expanded;
+            }
+            Message::ToggleColorCard => {
+                self.color_card.expanded = !self.color_card.expanded;
             }
             Message::SelectImage(index) => {
                 if index < self.samples.len() {
@@ -355,6 +407,26 @@ impl App {
                 self.update_selected_adjustments(|adjustments| adjustments.blacks = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
+            Message::TemperatureChanged(value) => {
+                self.basic_adjustments.temperature = value;
+                self.update_selected_adjustments(|adjustments| adjustments.temperature = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::TintChanged(value) => {
+                self.basic_adjustments.tint = value;
+                self.update_selected_adjustments(|adjustments| adjustments.tint = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::VibranceChanged(value) => {
+                self.basic_adjustments.vibrance = value;
+                self.update_selected_adjustments(|adjustments| adjustments.vibrance = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::SaturationChanged(value) => {
+                self.basic_adjustments.saturation = value;
+                self.update_selected_adjustments(|adjustments| adjustments.saturation = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
             Message::ToneMapperChanged(value) => {
                 self.basic_adjustments.tone_mapper = value;
                 self.update_selected_adjustments(|adjustments| adjustments.tone_mapper = value);
@@ -382,6 +454,97 @@ impl App {
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
                 }
+            }
+            Message::ActiveHslBandChanged(band) => {
+                self.active_hsl_band = band;
+            }
+            Message::HslHueChanged(value) => {
+                let band = self.active_hsl_band;
+                set_hsl_value(hsl_band_mut(&mut self.basic_adjustments.hsl, band), HslField::Hue, value);
+                self.update_selected_adjustments(|adjustments| {
+                    set_hsl_value(hsl_band_mut(&mut adjustments.hsl, band), HslField::Hue, value);
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::HslSaturationChanged(value) => {
+                let band = self.active_hsl_band;
+                set_hsl_value(
+                    hsl_band_mut(&mut self.basic_adjustments.hsl, band),
+                    HslField::Saturation,
+                    value,
+                );
+                self.update_selected_adjustments(|adjustments| {
+                    set_hsl_value(
+                        hsl_band_mut(&mut adjustments.hsl, band),
+                        HslField::Saturation,
+                        value,
+                    );
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::HslLuminanceChanged(value) => {
+                let band = self.active_hsl_band;
+                set_hsl_value(
+                    hsl_band_mut(&mut self.basic_adjustments.hsl, band),
+                    HslField::Luminance,
+                    value,
+                );
+                self.update_selected_adjustments(|adjustments| {
+                    set_hsl_value(
+                        hsl_band_mut(&mut adjustments.hsl, band),
+                        HslField::Luminance,
+                        value,
+                    );
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ColorGradingWheelChanged(zone, value) => {
+                self.active_color_grading_zone = zone;
+                *color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone) = value;
+                self.update_selected_adjustments(|adjustments| {
+                    *color_grading_zone_mut(&mut adjustments.color_grading, zone) = value;
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ColorGradingZoneLuminanceChanged(zone, value) => {
+                self.active_color_grading_zone = zone;
+                color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone).luminance = value;
+                self.update_selected_adjustments(|adjustments| {
+                    color_grading_zone_mut(&mut adjustments.color_grading, zone).luminance = value;
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ColorGradingBlendingChanged(value) => {
+                self.basic_adjustments.color_grading.blending = value;
+                self.update_selected_adjustments(|adjustments| adjustments.color_grading.blending = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ColorGradingBalanceChanged(value) => {
+                self.basic_adjustments.color_grading.balance = value;
+                self.update_selected_adjustments(|adjustments| adjustments.color_grading.balance = value);
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ResetColorAdjustments => {
+                let hsl = HslSettings::default();
+                let grading = ColorGradingSettingsUi::default();
+                let calibration = ColorCalibrationSettingsUi::default();
+                self.basic_adjustments.temperature = 0.0;
+                self.basic_adjustments.tint = 0.0;
+                self.basic_adjustments.vibrance = 0.0;
+                self.basic_adjustments.saturation = 0.0;
+                self.basic_adjustments.hsl = hsl.clone();
+                self.basic_adjustments.color_grading = grading.clone();
+                self.basic_adjustments.color_calibration = calibration.clone();
+                self.update_selected_adjustments(|adjustments| {
+                    adjustments.temperature = 0.0;
+                    adjustments.tint = 0.0;
+                    adjustments.vibrance = 0.0;
+                    adjustments.saturation = 0.0;
+                    adjustments.hsl = hsl.clone();
+                    adjustments.color_grading = grading.clone();
+                    adjustments.color_calibration = calibration.clone();
+                });
+                return self.request_preview_render(PreviewQuality::Full);
             }
             Message::CommitPreviewRender => {
                 if !self.samples.is_empty() {
@@ -417,6 +580,7 @@ impl App {
     fn is_animating_cards(&self) -> bool {
         (self.basic_card.progress - if self.basic_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
             || (self.curves_card.progress - if self.curves_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
+            || (self.color_card.progress - if self.color_card.expanded { 1.0 } else { 0.0 }).abs() > 0.01
     }
 
     fn update_selected_adjustments(
@@ -774,9 +938,135 @@ impl App {
             text("Curves unavailable").into()
         };
 
+        let current_hsl = *hsl_band(&self.basic_adjustments.hsl, self.active_hsl_band);
+        let color_body = column![
+            row![
+                text("White balance, grading, mixer, and calibration")
+                    .size(14)
+                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+                Space::with_width(Length::Fill),
+                icon_button("↺", Message::ResetColorAdjustments, "Reset color adjustments"),
+            ]
+            .align_y(iced::alignment::Vertical::Center),
+            card_section(
+                "White Balance",
+                column![
+                    basic_slider(
+                        "Temperature",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.temperature,
+                        Message::TemperatureChanged,
+                    ),
+                    basic_slider("Tint", -100.0, 100.0, self.basic_adjustments.tint, Message::TintChanged),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Presence",
+                column![
+                    basic_slider(
+                        "Vibrance",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.vibrance,
+                        Message::VibranceChanged,
+                    ),
+                    basic_slider(
+                        "Saturation",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.saturation,
+                        Message::SaturationChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Color Grading",
+                column![
+                    color_grading_wheel_panel(
+                        "Midtones",
+                        ColorGradingZone::Midtones,
+                        self.basic_adjustments.color_grading.midtones,
+                        150.0,
+                    ),
+                    row![
+                        color_grading_wheel_panel(
+                            "Shadows",
+                            ColorGradingZone::Shadows,
+                            self.basic_adjustments.color_grading.shadows,
+                            116.0,
+                        ),
+                        color_grading_wheel_panel(
+                            "Highlights",
+                            ColorGradingZone::Highlights,
+                            self.basic_adjustments.color_grading.highlights,
+                            116.0,
+                        ),
+                    ]
+                    .spacing(14),
+                    basic_slider(
+                        "Blending",
+                        0.0,
+                        100.0,
+                        self.basic_adjustments.color_grading.blending,
+                        Message::ColorGradingBlendingChanged,
+                    ),
+                    basic_slider(
+                        "Balance",
+                        -100.0,
+                        100.0,
+                        self.basic_adjustments.color_grading.balance,
+                        Message::ColorGradingBalanceChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section(
+                "Color Mixer",
+                column![
+                    row![
+                        color_swatch_button(HslBand::Reds, self.active_hsl_band),
+                        color_swatch_button(HslBand::Oranges, self.active_hsl_band),
+                        color_swatch_button(HslBand::Yellows, self.active_hsl_band),
+                        color_swatch_button(HslBand::Greens, self.active_hsl_band),
+                        color_swatch_button(HslBand::Aquas, self.active_hsl_band),
+                        color_swatch_button(HslBand::Blues, self.active_hsl_band),
+                        color_swatch_button(HslBand::Purples, self.active_hsl_band),
+                        color_swatch_button(HslBand::Magentas, self.active_hsl_band),
+                    ]
+                    .spacing(0)
+                    .width(Length::Fill),
+                    basic_slider("Hue", -100.0, 100.0, current_hsl.hue, Message::HslHueChanged),
+                    basic_slider(
+                        "Saturation",
+                        -100.0,
+                        100.0,
+                        current_hsl.saturation,
+                        Message::HslSaturationChanged,
+                    ),
+                    basic_slider(
+                        "Luminance",
+                        -100.0,
+                        100.0,
+                        current_hsl.luminance,
+                        Message::HslLuminanceChanged,
+                    ),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+        ]
+        .spacing(14);
+
         let controls = column![
             adjustment_card("Basic", self.basic_card, Message::ToggleBasicCard, basic_body.into(), 430.0),
             adjustment_card("Curves", self.curves_card, Message::ToggleCurvesCard, curves_body, 320.0),
+            adjustment_card("Color", self.color_card, Message::ToggleColorCard, color_body.into(), 1180.0),
             text("Preview updates live for the selected image.")
                 .size(13)
                 .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
@@ -1147,7 +1437,16 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
         shadows: value.get("shadows").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         whites: value.get("whites").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         blacks: value.get("blacks").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        saturation: value.get("saturation").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        temperature: value.get("temperature").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        tint: value.get("tint").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        vibrance: value.get("vibrance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         tone_mapper,
+        hsl: hsl_from_value(value.get("hsl").unwrap_or(&Value::Null)),
+        color_grading: color_grading_from_value(value.get("colorGrading").unwrap_or(&Value::Null)),
+        color_calibration: color_calibration_from_value(
+            value.get("colorCalibration").unwrap_or(&Value::Null),
+        ),
         curves: curves_from_value(value.get("curves").unwrap_or(&Value::Null)),
     }
 }
@@ -1161,6 +1460,10 @@ fn adjustments_to_value(adjustments: &BasicAdjustments) -> Value {
         "shadows": adjustments.shadows,
         "whites": adjustments.whites,
         "blacks": adjustments.blacks,
+        "saturation": adjustments.saturation,
+        "temperature": adjustments.temperature,
+        "tint": adjustments.tint,
+        "vibrance": adjustments.vibrance,
         "toneMapper": match adjustments.tone_mapper {
             ToneMapper::Basic => "basic",
             ToneMapper::AgX => "agx",
@@ -1180,8 +1483,112 @@ fn merge_basic_adjustments(target: &mut Value, adjustments: &BasicAdjustments) {
                 object.insert(key.clone(), value.clone());
             }
         }
+        object.insert("hsl".to_string(), hsl_to_value(&adjustments.hsl));
+        object.insert(
+            "colorGrading".to_string(),
+            color_grading_to_value(&adjustments.color_grading),
+        );
+        object.insert(
+            "colorCalibration".to_string(),
+            color_calibration_to_value(&adjustments.color_calibration),
+        );
         object.insert("curves".to_string(), curves_to_value(&adjustments.curves));
     }
+}
+
+fn hsl_from_value(value: &Value) -> HslSettings {
+    HslSettings {
+        reds: hue_sat_lum_from_value(value.get("reds").unwrap_or(&Value::Null)),
+        oranges: hue_sat_lum_from_value(value.get("oranges").unwrap_or(&Value::Null)),
+        yellows: hue_sat_lum_from_value(value.get("yellows").unwrap_or(&Value::Null)),
+        greens: hue_sat_lum_from_value(value.get("greens").unwrap_or(&Value::Null)),
+        aquas: hue_sat_lum_from_value(value.get("aquas").unwrap_or(&Value::Null)),
+        blues: hue_sat_lum_from_value(value.get("blues").unwrap_or(&Value::Null)),
+        purples: hue_sat_lum_from_value(value.get("purples").unwrap_or(&Value::Null)),
+        magentas: hue_sat_lum_from_value(value.get("magentas").unwrap_or(&Value::Null)),
+    }
+}
+
+fn color_grading_from_value(value: &Value) -> ColorGradingSettingsUi {
+    ColorGradingSettingsUi {
+        shadows: hue_sat_lum_from_value(value.get("shadows").unwrap_or(&Value::Null)),
+        midtones: hue_sat_lum_from_value(value.get("midtones").unwrap_or(&Value::Null)),
+        highlights: hue_sat_lum_from_value(value.get("highlights").unwrap_or(&Value::Null)),
+        blending: value.get("blending").and_then(Value::as_f64).unwrap_or(50.0) as f32,
+        balance: value.get("balance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+    }
+}
+
+fn color_calibration_from_value(value: &Value) -> ColorCalibrationSettingsUi {
+    ColorCalibrationSettingsUi {
+        shadows_tint: value.get("shadowsTint").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        red_hue: value.get("redHue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        red_saturation: value
+            .get("redSaturation")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        green_hue: value.get("greenHue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        green_saturation: value
+            .get("greenSaturation")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+        blue_hue: value.get("blueHue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        blue_saturation: value
+            .get("blueSaturation")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as f32,
+    }
+}
+
+fn hue_sat_lum_from_value(value: &Value) -> HueSatLum {
+    HueSatLum {
+        hue: value.get("hue").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        saturation: value.get("saturation").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        luminance: value.get("luminance").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+    }
+}
+
+fn hsl_to_value(value: &HslSettings) -> Value {
+    json!({
+        "reds": hue_sat_lum_to_value(value.reds),
+        "oranges": hue_sat_lum_to_value(value.oranges),
+        "yellows": hue_sat_lum_to_value(value.yellows),
+        "greens": hue_sat_lum_to_value(value.greens),
+        "aquas": hue_sat_lum_to_value(value.aquas),
+        "blues": hue_sat_lum_to_value(value.blues),
+        "purples": hue_sat_lum_to_value(value.purples),
+        "magentas": hue_sat_lum_to_value(value.magentas),
+    })
+}
+
+fn color_grading_to_value(value: &ColorGradingSettingsUi) -> Value {
+    json!({
+        "shadows": hue_sat_lum_to_value(value.shadows),
+        "midtones": hue_sat_lum_to_value(value.midtones),
+        "highlights": hue_sat_lum_to_value(value.highlights),
+        "blending": value.blending,
+        "balance": value.balance,
+    })
+}
+
+fn color_calibration_to_value(value: &ColorCalibrationSettingsUi) -> Value {
+    json!({
+        "shadowsTint": value.shadows_tint,
+        "redHue": value.red_hue,
+        "redSaturation": value.red_saturation,
+        "greenHue": value.green_hue,
+        "greenSaturation": value.green_saturation,
+        "blueHue": value.blue_hue,
+        "blueSaturation": value.blue_saturation,
+    })
+}
+
+fn hue_sat_lum_to_value(value: HueSatLum) -> Value {
+    json!({
+        "hue": value.hue,
+        "saturation": value.saturation,
+        "luminance": value.luminance,
+    })
 }
 
 fn curves_from_value(value: &Value) -> CurvesSettings {
@@ -1325,6 +1732,84 @@ fn curve_channel_color(channel: CurveChannel) -> Color {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HslField {
+    Hue,
+    Saturation,
+    Luminance,
+}
+
+fn hsl_band(settings: &HslSettings, band: HslBand) -> &HueSatLum {
+    match band {
+        HslBand::Reds => &settings.reds,
+        HslBand::Oranges => &settings.oranges,
+        HslBand::Yellows => &settings.yellows,
+        HslBand::Greens => &settings.greens,
+        HslBand::Aquas => &settings.aquas,
+        HslBand::Blues => &settings.blues,
+        HslBand::Purples => &settings.purples,
+        HslBand::Magentas => &settings.magentas,
+    }
+}
+
+fn hsl_band_mut(settings: &mut HslSettings, band: HslBand) -> &mut HueSatLum {
+    match band {
+        HslBand::Reds => &mut settings.reds,
+        HslBand::Oranges => &mut settings.oranges,
+        HslBand::Yellows => &mut settings.yellows,
+        HslBand::Greens => &mut settings.greens,
+        HslBand::Aquas => &mut settings.aquas,
+        HslBand::Blues => &mut settings.blues,
+        HslBand::Purples => &mut settings.purples,
+        HslBand::Magentas => &mut settings.magentas,
+    }
+}
+
+fn set_hsl_value(value: &mut HueSatLum, field: HslField, amount: f32) {
+    match field {
+        HslField::Hue => value.hue = amount,
+        HslField::Saturation => value.saturation = amount,
+        HslField::Luminance => value.luminance = amount,
+    }
+}
+
+fn color_grading_zone_mut(
+    settings: &mut ColorGradingSettingsUi,
+    zone: ColorGradingZone,
+) -> &mut HueSatLum {
+    match zone {
+        ColorGradingZone::Shadows => &mut settings.shadows,
+        ColorGradingZone::Midtones => &mut settings.midtones,
+        ColorGradingZone::Highlights => &mut settings.highlights,
+    }
+}
+
+fn hsl_band_color(band: HslBand) -> Color {
+    match band {
+        HslBand::Reds => Color::from_rgb8(0xf8, 0x71, 0x71),
+        HslBand::Oranges => Color::from_rgb8(0xfb, 0x92, 0x3c),
+        HslBand::Yellows => Color::from_rgb8(0xfa, 0xcc, 0x15),
+        HslBand::Greens => Color::from_rgb8(0x4a, 0xde, 0x80),
+        HslBand::Aquas => Color::from_rgb8(0x2d, 0xd4, 0xbf),
+        HslBand::Blues => Color::from_rgb8(0x60, 0xa5, 0xfa),
+        HslBand::Purples => Color::from_rgb8(0xa7, 0x8b, 0xfa),
+        HslBand::Magentas => Color::from_rgb8(0xf4, 0x72, 0xb6),
+    }
+}
+
+fn hsl_band_label(band: HslBand) -> &'static str {
+    match band {
+        HslBand::Reds => "Reds",
+        HslBand::Oranges => "Oranges",
+        HslBand::Yellows => "Yellows",
+        HslBand::Greens => "Greens",
+        HslBand::Aquas => "Aquas",
+        HslBand::Blues => "Blues",
+        HslBand::Purples => "Purples",
+        HslBand::Magentas => "Magentas",
+    }
+}
+
 fn panel_style(_theme: &Theme) -> container::Style {
     container::Style {
         text_color: Some(Color::WHITE),
@@ -1334,13 +1819,16 @@ fn panel_style(_theme: &Theme) -> container::Style {
     }
 }
 
-fn basic_slider<'a>(
+fn basic_slider<'a, F>(
     label: &'a str,
     min: f32,
     max: f32,
     value: f32,
-    on_change: fn(f32) -> Message,
-) -> Element<'a, Message> {
+    on_change: F,
+) -> Element<'a, Message>
+where
+    F: 'a + Fn(f32) -> Message,
+{
     column![
         row![
             text(label).size(15),
@@ -1410,7 +1898,9 @@ fn adjustment_card<'a>(
     expanded_height: f32,
 ) -> Element<'a, Message> {
     let expanded = card.expanded;
-    let body_content: Element<'a, Message> = if card.progress > 0.01 {
+    let body_content: Element<'a, Message> = if card.progress >= 0.99 {
+        container(body).into()
+    } else if card.progress > 0.01 {
         container(body)
             .height(Length::Fixed((expanded_height * card.progress).max(1.0)))
             .into()
@@ -1460,6 +1950,115 @@ fn icon_button<'a>(icon: &'a str, message: Message, _title: &'a str) -> Element<
             style
         })
         .on_press(message)
+        .into()
+}
+
+fn card_section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Message> {
+    container(
+        column![
+            text(title)
+                .size(15)
+                .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+            body,
+        ]
+        .spacing(10),
+    )
+    .padding(12)
+    .style(|_| container::Style {
+        text_color: Some(Color::WHITE),
+        background: Some(Background::Color(Color::from_rgb8(0x1d, 0x23, 0x2f))),
+        border: Border::default().rounded(14.0),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+fn color_swatch_button<'a>(band: HslBand, selected: HslBand) -> Element<'a, Message> {
+    let active = band == selected;
+    let fill = hsl_band_color(band);
+    let swatch = button(
+        container(Space::with_width(Length::Shrink))
+            .width(Length::Fixed(18.0))
+            .height(Length::Fixed(18.0))
+            .style(move |_| container::Style {
+                text_color: None,
+                background: Some(Background::Color(Color {
+                    a: 1.0,
+                    ..fill.scale_alpha(0.9)
+                })),
+                border: Border {
+                    color: if active {
+                        Color::WHITE
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: 2.0,
+                    radius: 999.0.into(),
+                },
+                ..container::Style::default()
+            }),
+    )
+        .width(Length::Fill)
+        .height(Length::Fixed(28.0))
+        .style(move |theme, status| {
+            let mut style = iced::widget::button::secondary(theme, status);
+            style.background = Some(Background::Color(Color::TRANSPARENT));
+            style.border = Border::default().rounded(999.0);
+            style
+        })
+        .on_press(Message::ActiveHslBandChanged(band));
+
+    tooltip(
+        swatch,
+        container(
+            text(hsl_band_label(band))
+                .size(12)
+                .color(Color::from_rgb8(0xe2, 0xe8, 0xf0)),
+        )
+        .padding([6, 10])
+        .style(|_| container::Style {
+            text_color: Some(Color::WHITE),
+            background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+            border: Border::default().rounded(10.0),
+            ..container::Style::default()
+        }),
+        tooltip::Position::Top,
+    )
+    .gap(8)
+    .into()
+}
+
+fn color_grading_wheel_panel<'a>(
+    label: &'a str,
+    zone: ColorGradingZone,
+    value: HueSatLum,
+    wheel_size: f32,
+) -> Element<'a, Message> {
+    let wheel = canvas::Canvas::new(ColorWheelEditor { zone, value })
+        .width(Length::Fixed(wheel_size))
+        .height(Length::Fixed(wheel_size));
+    let wheel_background = image(color_wheel_handle(wheel_size.round() as u32))
+        .width(Length::Fixed(wheel_size))
+        .height(Length::Fixed(wheel_size));
+
+    let content = column![
+        text(label)
+            .size(15)
+            .color(Color::from_rgb8(0xd8, 0xe1, 0xf0)),
+        stack![wheel_background, wheel],
+        basic_slider(
+            "Luminance",
+            -100.0,
+            100.0,
+            value.luminance,
+            move |amount| Message::ColorGradingZoneLuminanceChanged(zone, amount),
+        ),
+    ]
+    .spacing(10)
+    .align_x(iced::alignment::Horizontal::Center);
+
+    container(content)
+        .width(Length::Fill)
         .into()
 }
 
@@ -1726,6 +2325,192 @@ impl canvas::Program<Message> for CurveEditor {
             mouse::Interaction::default()
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ColorWheelEditor {
+    zone: ColorGradingZone,
+    value: HueSatLum,
+}
+
+impl canvas::Program<Message> for ColorWheelEditor {
+    type State = ColorWheelState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        let position = cursor.position_in(bounds);
+
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(position) = position
+                    && let Some(updated) = color_grading_value_from_position(position, bounds, self.value)
+                {
+                    state.dragging = true;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::ColorGradingWheelChanged(self.zone, updated)),
+                    );
+                }
+                (canvas::event::Status::Ignored, None)
+            }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.dragging
+                    && let Some(position) = position
+                    && let Some(updated) = color_grading_value_from_position(position, bounds, self.value)
+                {
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::ColorGradingWheelChanged(self.zone, updated)),
+                    );
+                }
+                (canvas::event::Status::Ignored, None)
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.dragging {
+                    state.dragging = false;
+                    return (canvas::event::Status::Captured, Some(Message::CommitPreviewRender));
+                }
+                (canvas::event::Status::Ignored, None)
+            }
+            _ => (canvas::event::Status::Ignored, None),
+        }
+    }
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let radius = (bounds.width.min(bounds.height) * 0.5) - 6.0;
+        let center = Point::new(bounds.width * 0.5, bounds.height * 0.5);
+
+        frame.stroke(
+            &canvas::Path::circle(center, radius),
+            canvas::Stroke::default()
+                .with_width(1.0)
+                .with_color(Color::from_rgba8(0xff, 0xff, 0xff, 0.08)),
+        );
+
+        let marker = color_grading_marker_point(self.value, bounds);
+        let shadow = canvas::Path::circle(marker, 11.0);
+        frame.fill(&shadow, Color::from_rgba8(0x00, 0x00, 0x00, 0.18));
+        let ring = canvas::Path::circle(marker, 10.0);
+        frame.fill(&ring, Color::from_rgba8(0xff, 0xff, 0xff, 0.88));
+        let inner = canvas::Path::circle(marker, 6.0);
+        frame.fill(
+            &inner,
+            hsv_to_color(self.value.hue, (self.value.saturation / 100.0).clamp(0.0, 1.0), 1.0),
+        );
+
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &Self::State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if state.dragging
+            || cursor
+                .position_in(bounds)
+                .and_then(|position| color_grading_value_from_position(position, bounds, self.value))
+                .is_some()
+        {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+}
+
+fn color_grading_value_from_position(
+    position: Point,
+    bounds: Rectangle,
+    current: HueSatLum,
+) -> Option<HueSatLum> {
+    let center = Point::new(bounds.width * 0.5, bounds.height * 0.5);
+    let radius = (bounds.width.min(bounds.height) * 0.5) - 6.0;
+    let dx = position.x - center.x;
+    let dy = position.y - center.y;
+    let distance = (dx * dx + dy * dy).sqrt();
+    if distance > radius {
+        return None;
+    }
+
+    Some(HueSatLum {
+        hue: dy.atan2(dx).to_degrees().rem_euclid(360.0),
+        saturation: (distance / radius * 100.0).clamp(0.0, 100.0),
+        luminance: current.luminance,
+    })
+}
+
+fn color_grading_marker_point(value: HueSatLum, bounds: Rectangle) -> Point {
+    let center = Point::new(bounds.width * 0.5, bounds.height * 0.5);
+    let radius = (bounds.width.min(bounds.height) * 0.5) - 6.0;
+    let angle = value.hue.to_radians();
+    let distance = (value.saturation / 100.0).clamp(0.0, 1.0) * radius;
+    Point::new(
+        center.x + angle.cos() * distance,
+        center.y + angle.sin() * distance,
+    )
+}
+
+fn hsv_to_color(hue: f32, saturation: f32, value: f32) -> Color {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = value * saturation;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let (r1, g1, b1) = match h {
+        h if h < 1.0 => (c, x, 0.0),
+        h if h < 2.0 => (x, c, 0.0),
+        h if h < 3.0 => (0.0, c, x),
+        h if h < 4.0 => (0.0, x, c),
+        h if h < 5.0 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = value - c;
+    Color::from_rgb(r1 + m, g1 + m, b1 + m)
+}
+
+fn color_wheel_handle(size: u32) -> image::Handle {
+    let size = size.max(2);
+    let radius = (size as f32 * 0.5) - 2.0;
+    let center = size as f32 * 0.5;
+    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
+
+    for y in 0..size {
+        for x in 0..size {
+            let dx = x as f32 + 0.5 - center;
+            let dy = y as f32 + 0.5 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+
+            if distance > radius {
+                pixels.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+
+            let hue = dy.atan2(dx).to_degrees().rem_euclid(360.0);
+            let saturation = (distance / radius).clamp(0.0, 1.0);
+            let feather = ((radius - distance) / 1.5).clamp(0.0, 1.0);
+            let color = hsv_to_color(hue, saturation, 1.0);
+
+            pixels.push((color.r * 255.0) as u8);
+            pixels.push((color.g * 255.0) as u8);
+            pixels.push((color.b * 255.0) as u8);
+            pixels.push((feather * 255.0) as u8);
+        }
+    }
+
+    image::Handle::from_rgba(size, size, pixels)
 }
 
 fn point_from_position(position: Point, bounds: Rectangle) -> CurvePoint {
