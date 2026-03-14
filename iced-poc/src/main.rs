@@ -236,6 +236,7 @@ const FILMSTRIP_CARD_RADIUS: f32 = 14.0;
 const FILMSTRIP_CARD_PADDING: f32 = 6.0;
 const FILMSTRIP_IMAGE_RADIUS: f32 = 24.0;
 const FILMSTRIP_IMAGE_RADIUS_PX: u32 = FILMSTRIP_IMAGE_RADIUS as u32;
+const APP_SPACING: f32 = 10.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ImageMetadata {
@@ -1402,6 +1403,26 @@ impl App {
         let Some(selected) = self.samples.get(self.selected_index) else {
             return self.view_home();
         };
+        let (image_width, image_height) = selected.full_preview_image.dimensions();
+        let image_badge = container(
+            row![
+                text(&selected.name)
+                    .size(16)
+                    .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+                text(format!("{image_width}×{image_height}"))
+                    .size(14)
+                    .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
+            ]
+            .align_y(iced::alignment::Vertical::Center)
+            .spacing(10),
+        )
+        .padding([8, 12])
+        .style(|_| container::Style {
+            text_color: Some(Color::WHITE),
+            background: Some(Background::Color(Color::from_rgb8(0x1b, 0x22, 0x2f))),
+            border: Border::default().rounded(999.0),
+            ..container::Style::default()
+        });
 
         let top_bar = row![
             top_bar_icon_button(AppIcon::ArrowLeft, Some(Message::BackToHome), "Back"),
@@ -1410,12 +1431,9 @@ impl App {
                 (!self.is_loading).then_some(Message::OpenFolder),
                 "Open folder",
             ),
-            Space::with_width(Length::Fixed(12.0)),
-            column![
-                text(&selected.name).size(28),
-                text(selected.path.display().to_string())
-                    .size(14)
-                    .color(Color::from_rgb8(0xa8, 0xb2, 0xc8)),
+            Space::with_width(Length::Fixed(APP_SPACING)),
+            row![
+                image_badge,
                 text(format!("{} selected", self.selected_indices.len().max(1)))
                     .size(13)
                     .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
@@ -1429,10 +1447,12 @@ impl App {
                 } else {
                     text(" ").size(13).color(Color::TRANSPARENT).into()
                 },
-            ],
+            ]
+            .align_y(iced::alignment::Vertical::Center)
+            .spacing(APP_SPACING),
         ]
         .align_y(iced::alignment::Vertical::Center)
-        .spacing(10);
+        .spacing(APP_SPACING);
 
         let preview = container(
             image(
@@ -1487,17 +1507,17 @@ impl App {
                 .width(Length::Fixed(330.0))
                 .height(Length::Fill)
         ]
-        .spacing(18)
+        .spacing(APP_SPACING)
         .height(Length::Fill);
 
         let layout = column![top_bar, editor_body, filmstrip]
-            .spacing(18)
+            .spacing(APP_SPACING)
             .height(Length::Fill);
 
         container(layout)
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding([28, 28])
+            .padding(APP_SPACING)
             .into()
     }
 
@@ -1640,13 +1660,6 @@ impl App {
                 ),
             ]
             .align_y(iced::alignment::Vertical::Center),
-            text(if self.selected_indices.len() > 1 {
-                "Changes apply to all selected images."
-            } else {
-                "Changes apply to the active image."
-            })
-            .size(13)
-            .color(Color::from_rgb8(0x8d, 0x98, 0xae)),
             column![
                 text("Tone Mapper")
                     .size(14)
@@ -3787,12 +3800,42 @@ fn header_status<'a>(status: &'a str) -> Element<'a, Message> {
             .size(13)
             .color(Color::from_rgb8(0xf5, 0xd0, 0x7a))
             .into()
-    } else {
+    } else if is_error_status(status) {
         text(status)
             .size(13)
             .color(Color::from_rgb8(0xff, 0xb4, 0xb4))
             .into()
+    } else if is_info_status(status) {
+        text(status)
+            .size(13)
+            .color(Color::from_rgb8(0xd5, 0xe6, 0xff))
+            .into()
+    } else {
+        row![
+            app_icon(AppIcon::Check, 13.0, Color::from_rgb8(0x86, 0xef, 0xac)),
+            text(status)
+                .size(13)
+                .color(Color::from_rgb8(0x86, 0xef, 0xac)),
+        ]
+        .spacing(6)
+        .align_y(iced::alignment::Vertical::Center)
+        .into()
     }
+}
+
+fn is_error_status(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    lower.contains("failed")
+        || lower.contains("unavailable")
+        || lower.contains("could not")
+        || lower.contains("error")
+}
+
+fn is_info_status(status: &str) -> bool {
+    let lower = status.to_ascii_lowercase();
+    lower.starts_with("loading ")
+        || lower.starts_with("rendering ")
+        || lower.starts_with("loaded ")
 }
 
 fn step_card_animation(card: &mut CardAnimation) {
