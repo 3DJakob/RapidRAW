@@ -1,0 +1,20 @@
+[package]
+name = "rapidraw-iced-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.13", features = ["image", "advanced", "canvas"] }
+image = "0.25.9"
+rawler = { path = "../src-tauri/rawler/rawler" }
+rfd = "0.15.4"
+bytemuck = { version = "1.24", features = ["derive"] }
+glam = "0.30.9"
+half = { version = "2.7.1", features = ["bytemuck"] }
+pollster = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+wgpu = "28.0"
+
+[profile.dev.package."*"]
+opt-level = 3

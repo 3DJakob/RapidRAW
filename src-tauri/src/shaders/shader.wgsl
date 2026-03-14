@@ -268,7 +268,7 @@ fn hsv_to_rgb(c: vec3<f32>) -> vec3<f32> {
 
 fn get_raw_hsl_influence(hue: f32, center: f32, width: f32) -> f32 {
     let dist = min(abs(hue - center), 360.0 - abs(hue - center));
-    const sharpness = 1.5; 
+    let sharpness = 1.5;
     let falloff = dist / (width * 0.5);
     return exp(-sharpness * falloff * falloff);
 }
@@ -500,8 +500,8 @@ fn apply_filmic_exposure(color_in: vec3<f32>, brightness_adj: f32) -> vec3<f32> 
     if (brightness_adj == 0.0) {
         return color_in;
     }
-    const RATIONAL_CURVE_MIX: f32 = 0.95;
-    const MIDTONE_STRENGTH: f32 = 1.2;
+    let RATIONAL_CURVE_MIX: f32 = 0.95;
+    let MIDTONE_STRENGTH: f32 = 1.2;
     let original_luma = get_luma(color_in);
     if (abs(original_luma) < 0.00001) {
         return color_in;
@@ -771,7 +771,7 @@ fn apply_centre_local_contrast(
     let vignette_mask = smoothstep(midpoint - feather, midpoint + feather, d);
     let centre_mask = 1.0 - vignette_mask;
 
-    const CLARITY_SCALE: f32 = 0.9;
+    let CLARITY_SCALE: f32 = 0.9;
     var processed_color = color_in;
     let clarity_strength = centre_amount * (2.0 * centre_mask - 1.0) * CLARITY_SCALE;
 
@@ -800,10 +800,10 @@ fn apply_centre_tonal_and_color(
     let vignette_mask = smoothstep(midpoint - feather, midpoint + feather, d);
     let centre_mask = 1.0 - vignette_mask;
 
-    const EXPOSURE_SCALE: f32 = 0.5;
-    const VIBRANCE_SCALE: f32 = 0.4;
-    const SATURATION_CENTER_SCALE: f32 = 0.3;
-    const SATURATION_EDGE_SCALE: f32 = 0.8;
+    let EXPOSURE_SCALE: f32 = 0.5;
+    let VIBRANCE_SCALE: f32 = 0.4;
+    let SATURATION_CENTER_SCALE: f32 = 0.3;
+    let SATURATION_EDGE_SCALE: f32 = 0.8;
 
     var processed_color = color_in;
     
@@ -971,11 +971,11 @@ fn agx_full_transform(color_in: vec3<f32>) -> vec3<f32> {
 }
 
 fn legacy_tonemap(c: vec3<f32>) -> vec3<f32> {
-    const a: f32 = 2.51;
-    const b: f32 = 0.03;
-    const c_const: f32 = 2.43;
-    const d: f32 = 0.59;
-    const e: f32 = 0.14;
+    let a: f32 = 2.51;
+    let b: f32 = 0.03;
+    let c_const: f32 = 2.43;
+    let d: f32 = 0.59;
+    let e: f32 = 0.14;
 
     let x = max(c, vec3<f32>(0.0));
 
@@ -1336,7 +1336,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let out_dims = vec2<u32>(textureDimensions(output_texture));
     if (id.x >= out_dims.x || id.y >= out_dims.y) { return; }
 
-    const REFERENCE_DIMENSION: f32 = 1080.0;
+    let REFERENCE_DIMENSION: f32 = 1080.0;
     let full_dims = vec2<f32>(textureDimensions(input_texture));
     let current_ref_dim = min(full_dims.x, full_dims.y);
     let scale = max(0.1, current_ref_dim / REFERENCE_DIMENSION);
@@ -1384,9 +1384,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     if (adjustments.global.is_raw_image == 1u && adjustments.global.tonemapper_mode != 1u) {
         var srgb_emulated = linear_to_srgb(processed_rgb);
-        const BRIGHTNESS_GAMMA: f32 = 1.1;
+        let BRIGHTNESS_GAMMA: f32 = 1.1;
         srgb_emulated = pow(srgb_emulated, vec3<f32>(1.0 / BRIGHTNESS_GAMMA));
-        const CONTRAST_MIX: f32 = 0.75;
+        let CONTRAST_MIX: f32 = 0.75;
         let contrast_curve = srgb_emulated * srgb_emulated * (3.0 - 2.0 * srgb_emulated);
         srgb_emulated = mix(srgb_emulated, contrast_curve, CONTRAST_MIX);
         processed_rgb = srgb_to_linear(srgb_emulated);

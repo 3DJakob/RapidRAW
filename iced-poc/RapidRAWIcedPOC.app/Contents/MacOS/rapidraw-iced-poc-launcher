@@ -1,0 +1,15 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+APP_DIR="${SCRIPT_DIR:h:h}"
+POC_DIR="${APP_DIR:h}"
+BIN_PATH="${POC_DIR}/target/debug/rapidraw-iced-poc"
+
+cd "${POC_DIR}"
+
+if [[ ! -x "${BIN_PATH}" ]]; then
+  /usr/bin/env cargo build --manifest-path "${POC_DIR}/Cargo.toml"
+fi
+
+exec "${BIN_PATH}"

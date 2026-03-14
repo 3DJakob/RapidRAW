@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "rating": 0,
+  "adjustments": {
+    "blacks": 0.0,
+    "brightness": 0.0,
+    "contrast": 0.0,
+    "curves": {
+      "blue": [
+        {
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "x": 255.0,
+          "y": 255.0
+        }
+      ],
+      "green": [
+        {
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "x": 255.0,
+          "y": 255.0
+        }
+      ],
+      "luma": [
+        {
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "x": 255.0,
+          "y": 255.0
+        }
+      ],
+      "red": [
+        {
+          "x": 0.0,
+          "y": 0.0
+        },
+        {
+          "x": 255.0,
+          "y": 255.0
+        }
+      ]
+    },
+    "exposure": 0.0,
+    "highlights": 0.0,
+    "shadows": 0.0,
+    "toneMapper": "agx",
+    "whites": 0.0
+  },
+  "tags": null
+}
