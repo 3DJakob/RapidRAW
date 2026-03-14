@@ -2704,6 +2704,7 @@ fn lut_browser_list<'a>(
                 entry,
                 selected_lut_path == Some(entry.path.to_string_lossy().as_ref()),
                 !browser.collapsed && browser.hovered_index == Some(index),
+                browser.collapsed,
             ))
         },
     )
@@ -2715,6 +2716,7 @@ fn lut_browser_item<'a>(
     entry: &'a LutListEntry,
     selected: bool,
     hovered: bool,
+    collapsed: bool,
 ) -> Element<'a, Message> {
     let background = if hovered {
         Color::from_rgb8(0x2a, 0x34, 0x46)
@@ -2730,7 +2732,7 @@ fn lut_browser_item<'a>(
                 .size(14)
                 .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
             Space::with_width(Length::Fill),
-            if selected {
+            if selected && collapsed {
                 lut_selected_check()
             } else {
                 Space::with_width(Length::Shrink).into()
@@ -2782,7 +2784,7 @@ fn muted_line<'a>(content: impl Into<String>) -> Element<'a, Message> {
 }
 
 fn lut_selected_check<'a>() -> Element<'a, Message> {
-    text("✓").size(14).color(Color::WHITE).into()
+    text("▾").size(14).color(Color::WHITE).into()
 }
 
 fn color_swatch_button<'a>(band: HslBand, selected: HslBand) -> Element<'a, Message> {
