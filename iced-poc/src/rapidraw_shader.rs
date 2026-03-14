@@ -137,7 +137,7 @@ pub fn default_curve_points() -> Vec<CurvePoint> {
     ]
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasicAdjustments {
     pub exposure: f32,
     pub brightness: f32,

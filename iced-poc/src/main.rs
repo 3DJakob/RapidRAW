@@ -3,7 +3,7 @@ mod rapidraw_shader;
 use iced::widget::{
     Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack, text, tooltip,
 };
-use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme, application, mouse, window};
+use iced::{Background, Border, Color, Element, Length, Point, Rectangle, Size, Subscription, Task, Theme, application, keyboard, mouse, window};
 use ::image::{DynamicImage, GenericImageView, RgbImage, imageops::FilterType, open as open_image};
 use rawler::{
     decoders::{Orientation, RawDecodeParams},
@@ -43,6 +43,7 @@ enum Message {
     FolderLoaded(Result<LoadedFolder, String>),
     SelectImage(usize),
     ModifiersChanged(iced::keyboard::Modifiers),
+    UndoRequested,
     AnimationFrame(Instant),
     ToggleBasicCard,
     ToggleCurvesCard,
@@ -134,6 +135,25 @@ struct App {
     is_rendering_preview: bool,
     pending_preview_quality: Option<PreviewQuality>,
     renderer: Option<RapidRawRenderer>,
+    undo_stack: Vec<UndoEntry>,
+    pending_drag_undo: Option<UndoEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct UndoEntry {
+    changes: Vec<UndoChange>,
+}
+
+#[derive(Debug, Clone)]
+struct UndoChange {
+    index: usize,
+    adjustments: BasicAdjustments,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UndoBehavior {
+    Immediate,
+    Coalesced,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -314,6 +334,8 @@ impl App {
             is_rendering_preview: false,
             pending_preview_quality: None,
             renderer,
+            undo_stack: Vec::new(),
+            pending_drag_undo: None,
         };
 
         if let Some(sample) = app.samples.first() {
@@ -335,8 +357,13 @@ impl App {
 
     fn subscription(&self) -> iced::Subscription<Message> {
         let modifiers = iced::event::listen_with(|event, _status, _window| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 Some(Message::ModifiersChanged(modifiers))
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if modifiers.command() && matches_undo_key(&key) =>
+            {
+                Some(Message::UndoRequested)
             }
             _ => None,
         });
@@ -351,6 +378,7 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::EnterEditor => {
+                self.finish_pending_drag_undo();
                 if !self.samples.is_empty() {
                     self.route = Route::Editor;
                     self.basic_adjustments = self
@@ -363,9 +391,11 @@ impl App {
                 }
             }
             Message::BackToHome => {
+                self.finish_pending_drag_undo();
                 self.route = Route::Home;
             }
             Message::OpenFolder => {
+                self.finish_pending_drag_undo();
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.is_loading = true;
                     self.status_message = Some(format!("Loading images from {}...", path.display()));
@@ -424,6 +454,29 @@ impl App {
             Message::ModifiersChanged(modifiers) => {
                 self.shift_pressed = modifiers.shift();
             }
+            Message::UndoRequested => {
+                self.finish_pending_drag_undo();
+                if let Some(entry) = self.undo_stack.pop() {
+                    let indices = entry.changes.iter().map(|change| change.index).collect::<Vec<_>>();
+                    for change in entry.changes {
+                        if let Some(sample) = self.samples.get_mut(change.index) {
+                            sample.adjustments = change.adjustments;
+                            if let Err(error) = save_sample_adjustments(sample) {
+                                self.status_message = Some(error);
+                            }
+                        }
+                    }
+                    if let Some(sample) = self.samples.get(self.selected_index) {
+                        self.basic_adjustments = sample.adjustments.clone();
+                    }
+                    self.lut_browser.hovered_index = None;
+                    self.status_message = Some("Undid last adjustment.".to_string());
+                    return Task::batch(vec![
+                        self.request_preview_render(PreviewQuality::Full),
+                        self.request_thumbnail_render(indices),
+                    ]);
+                }
+            }
             Message::AnimationFrame(_instant) => {
                 step_card_animation(&mut self.basic_card);
                 step_card_animation(&mut self.curves_card);
@@ -447,6 +500,7 @@ impl App {
                 self.effects_card.expanded = !self.effects_card.expanded;
             }
             Message::SelectImage(index) => {
+                self.finish_pending_drag_undo();
                 if index < self.samples.len() {
                     if self.shift_pressed {
                         self.selected_indices.insert(index);
@@ -463,146 +517,146 @@ impl App {
             }
             Message::ExposureChanged(value) => {
                 self.basic_adjustments.exposure = value;
-                self.update_selected_adjustments(|adjustments| adjustments.exposure = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.exposure = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::BrightnessChanged(value) => {
                 self.basic_adjustments.brightness = value;
-                self.update_selected_adjustments(|adjustments| adjustments.brightness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.brightness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ContrastChanged(value) => {
                 self.basic_adjustments.contrast = value;
-                self.update_selected_adjustments(|adjustments| adjustments.contrast = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.contrast = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HighlightsChanged(value) => {
                 self.basic_adjustments.highlights = value;
-                self.update_selected_adjustments(|adjustments| adjustments.highlights = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.highlights = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ShadowsChanged(value) => {
                 self.basic_adjustments.shadows = value;
-                self.update_selected_adjustments(|adjustments| adjustments.shadows = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.shadows = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::WhitesChanged(value) => {
                 self.basic_adjustments.whites = value;
-                self.update_selected_adjustments(|adjustments| adjustments.whites = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.whites = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::BlacksChanged(value) => {
                 self.basic_adjustments.blacks = value;
-                self.update_selected_adjustments(|adjustments| adjustments.blacks = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.blacks = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::TemperatureChanged(value) => {
                 self.basic_adjustments.temperature = value;
-                self.update_selected_adjustments(|adjustments| adjustments.temperature = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.temperature = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::TintChanged(value) => {
                 self.basic_adjustments.tint = value;
-                self.update_selected_adjustments(|adjustments| adjustments.tint = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.tint = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VibranceChanged(value) => {
                 self.basic_adjustments.vibrance = value;
-                self.update_selected_adjustments(|adjustments| adjustments.vibrance = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vibrance = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SaturationChanged(value) => {
                 self.basic_adjustments.saturation = value;
-                self.update_selected_adjustments(|adjustments| adjustments.saturation = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.saturation = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SharpnessChanged(value) => {
                 self.basic_adjustments.sharpness = value;
-                self.update_selected_adjustments(|adjustments| adjustments.sharpness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.sharpness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ClarityChanged(value) => {
                 self.basic_adjustments.clarity = value;
-                self.update_selected_adjustments(|adjustments| adjustments.clarity = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.clarity = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::DehazeChanged(value) => {
                 self.basic_adjustments.dehaze = value;
-                self.update_selected_adjustments(|adjustments| adjustments.dehaze = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.dehaze = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::StructureChanged(value) => {
                 self.basic_adjustments.structure = value;
-                self.update_selected_adjustments(|adjustments| adjustments.structure = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.structure = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::CentreChanged(value) => {
                 self.basic_adjustments.centre = value;
-                self.update_selected_adjustments(|adjustments| adjustments.centre = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.centre = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ChromaticAberrationRedCyanChanged(value) => {
                 self.basic_adjustments.chromatic_aberration_red_cyan = value;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     adjustments.chromatic_aberration_red_cyan = value;
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ChromaticAberrationBlueYellowChanged(value) => {
                 self.basic_adjustments.chromatic_aberration_blue_yellow = value;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     adjustments.chromatic_aberration_blue_yellow = value;
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GlowAmountChanged(value) => {
                 self.basic_adjustments.glow_amount = value;
-                self.update_selected_adjustments(|adjustments| adjustments.glow_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.glow_amount = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HalationAmountChanged(value) => {
                 self.basic_adjustments.halation_amount = value;
-                self.update_selected_adjustments(|adjustments| adjustments.halation_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.halation_amount = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::FlareAmountChanged(value) => {
                 self.basic_adjustments.flare_amount = value;
-                self.update_selected_adjustments(|adjustments| adjustments.flare_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.flare_amount = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteAmountChanged(value) => {
                 self.basic_adjustments.vignette_amount = value;
-                self.update_selected_adjustments(|adjustments| adjustments.vignette_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_amount = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteMidpointChanged(value) => {
                 self.basic_adjustments.vignette_midpoint = value;
-                self.update_selected_adjustments(|adjustments| adjustments.vignette_midpoint = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_midpoint = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteRoundnessChanged(value) => {
                 self.basic_adjustments.vignette_roundness = value;
-                self.update_selected_adjustments(|adjustments| adjustments.vignette_roundness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_roundness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::VignetteFeatherChanged(value) => {
                 self.basic_adjustments.vignette_feather = value;
-                self.update_selected_adjustments(|adjustments| adjustments.vignette_feather = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.vignette_feather = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainAmountChanged(value) => {
                 self.basic_adjustments.grain_amount = value;
-                self.update_selected_adjustments(|adjustments| adjustments.grain_amount = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_amount = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainSizeChanged(value) => {
                 self.basic_adjustments.grain_size = value;
-                self.update_selected_adjustments(|adjustments| adjustments.grain_size = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_size = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::GrainRoughnessChanged(value) => {
                 self.basic_adjustments.grain_roughness = value;
-                self.update_selected_adjustments(|adjustments| adjustments.grain_roughness = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.grain_roughness = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::SelectLut => {
@@ -621,7 +675,7 @@ impl App {
                             self.basic_adjustments.lut_path = Some(lut_path.clone());
                             self.basic_adjustments.lut_name = Some(lut_name.clone());
                             self.basic_adjustments.lut_size = lut_size;
-                            self.update_selected_adjustments(|adjustments| {
+                            self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                                 adjustments.lut_path = Some(lut_path.clone());
                                 adjustments.lut_name = Some(lut_name.clone());
                                 adjustments.lut_size = lut_size;
@@ -666,7 +720,7 @@ impl App {
                 self.basic_adjustments.lut_intensity = 100.0;
                 self.lut_browser.hovered_index = None;
                 self.lut_browser.collapsed = false;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     adjustments.lut_path = None;
                     adjustments.lut_name = None;
                     adjustments.lut_size = 0;
@@ -676,7 +730,7 @@ impl App {
             }
             Message::LutIntensityChanged(value) => {
                 self.basic_adjustments.lut_intensity = value;
-                self.update_selected_adjustments(|adjustments| adjustments.lut_intensity = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.lut_intensity = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::HoverLut(index) => {
@@ -704,7 +758,7 @@ impl App {
                     self.basic_adjustments.lut_size = entry.size;
                     self.lut_browser.hovered_index = None;
                     self.lut_browser.collapsed = true;
-                    self.update_selected_adjustments(|adjustments| {
+                    self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                         adjustments.lut_path = Some(lut_path.clone());
                         adjustments.lut_name = Some(entry.name.clone());
                         adjustments.lut_size = entry.size;
@@ -715,7 +769,7 @@ impl App {
             }
             Message::ToneMapperChanged(value) => {
                 self.basic_adjustments.tone_mapper = value;
-                self.update_selected_adjustments(|adjustments| adjustments.tone_mapper = value);
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| adjustments.tone_mapper = value);
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::ActiveCurveChannelChanged(channel) => {
@@ -723,20 +777,20 @@ impl App {
             }
             Message::CurveChanged(channel, points) => {
                 let points = sanitize_curve_points(points);
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     curve_points_mut(&mut adjustments.curves, channel).clone_from(&points);
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ResetCurveChannel(channel) => {
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     *curve_points_mut(&mut adjustments.curves, channel) = default_curve_points();
                 });
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::ResetBasicAdjustments => {
                 self.basic_adjustments = BasicAdjustments::default();
-                self.update_selected_adjustments(|adjustments| *adjustments = BasicAdjustments::default());
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| *adjustments = BasicAdjustments::default());
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
                 }
@@ -747,7 +801,7 @@ impl App {
             Message::HslHueChanged(value) => {
                 let band = self.active_hsl_band;
                 set_hsl_value(hsl_band_mut(&mut self.basic_adjustments.hsl, band), HslField::Hue, value);
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     set_hsl_value(hsl_band_mut(&mut adjustments.hsl, band), HslField::Hue, value);
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
@@ -759,7 +813,7 @@ impl App {
                     HslField::Saturation,
                     value,
                 );
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     set_hsl_value(
                         hsl_band_mut(&mut adjustments.hsl, band),
                         HslField::Saturation,
@@ -775,7 +829,7 @@ impl App {
                     HslField::Luminance,
                     value,
                 );
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     set_hsl_value(
                         hsl_band_mut(&mut adjustments.hsl, band),
                         HslField::Luminance,
@@ -787,7 +841,7 @@ impl App {
             Message::ColorGradingWheelChanged(zone, value) => {
                 self.active_color_grading_zone = zone;
                 *color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone) = value;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     *color_grading_zone_mut(&mut adjustments.color_grading, zone) = value;
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
@@ -795,19 +849,19 @@ impl App {
             Message::ColorGradingZoneLuminanceChanged(zone, value) => {
                 self.active_color_grading_zone = zone;
                 color_grading_zone_mut(&mut self.basic_adjustments.color_grading, zone).luminance = value;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
                     color_grading_zone_mut(&mut adjustments.color_grading, zone).luminance = value;
                 });
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ColorGradingBlendingChanged(value) => {
                 self.basic_adjustments.color_grading.blending = value;
-                self.update_selected_adjustments(|adjustments| adjustments.color_grading.blending = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.color_grading.blending = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ColorGradingBalanceChanged(value) => {
                 self.basic_adjustments.color_grading.balance = value;
-                self.update_selected_adjustments(|adjustments| adjustments.color_grading.balance = value);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| adjustments.color_grading.balance = value);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ResetColorAdjustments => {
@@ -821,7 +875,7 @@ impl App {
                 self.basic_adjustments.hsl = hsl.clone();
                 self.basic_adjustments.color_grading = grading.clone();
                 self.basic_adjustments.color_calibration = calibration.clone();
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     adjustments.temperature = 0.0;
                     adjustments.tint = 0.0;
                     adjustments.vibrance = 0.0;
@@ -840,7 +894,7 @@ impl App {
                 self.basic_adjustments.centre = 0.0;
                 self.basic_adjustments.chromatic_aberration_red_cyan = 0.0;
                 self.basic_adjustments.chromatic_aberration_blue_yellow = 0.0;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     adjustments.sharpness = 0.0;
                     adjustments.clarity = 0.0;
                     adjustments.dehaze = 0.0;
@@ -866,7 +920,7 @@ impl App {
                 self.basic_adjustments.grain_amount = 0.0;
                 self.basic_adjustments.grain_size = 25.0;
                 self.basic_adjustments.grain_roughness = 50.0;
-                self.update_selected_adjustments(|adjustments| {
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     adjustments.glow_amount = 0.0;
                     adjustments.halation_amount = 0.0;
                     adjustments.flare_amount = 0.0;
@@ -885,6 +939,7 @@ impl App {
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::CommitPreviewRender => {
+                self.finish_pending_drag_undo();
                 if !self.samples.is_empty() {
                     return self.request_preview_render(PreviewQuality::Full);
                 }
@@ -937,25 +992,64 @@ impl App {
 
     fn update_selected_adjustments(
         &mut self,
+        undo_behavior: UndoBehavior,
         update: impl Fn(&mut BasicAdjustments),
     ) {
+        if matches!(undo_behavior, UndoBehavior::Immediate) {
+            self.finish_pending_drag_undo();
+        }
+
         let selected: Vec<usize> = if self.selected_indices.is_empty() {
             vec![self.selected_index]
         } else {
             self.selected_indices.iter().copied().collect()
         };
 
+        let mut undo_changes = Vec::new();
+
         for index in selected {
             if let Some(sample) = self.samples.get_mut(index) {
+                let previous = sample.adjustments.clone();
                 update(&mut sample.adjustments);
+                if sample.adjustments != previous {
+                    undo_changes.push(UndoChange {
+                        index,
+                        adjustments: previous,
+                    });
+                }
                 if let Err(error) = save_sample_adjustments(sample) {
                     self.status_message = Some(error);
                 }
             }
         }
 
+        if !undo_changes.is_empty() {
+            match undo_behavior {
+                UndoBehavior::Immediate => self.push_undo_entry(UndoEntry { changes: undo_changes }),
+                UndoBehavior::Coalesced => {
+                    if self.pending_drag_undo.is_none() {
+                        self.pending_drag_undo = Some(UndoEntry { changes: undo_changes });
+                    }
+                }
+            }
+        }
+
         if let Some(sample) = self.samples.get(self.selected_index) {
             self.basic_adjustments = sample.adjustments.clone();
+        }
+    }
+
+    fn push_undo_entry(&mut self, entry: UndoEntry) {
+        self.undo_stack.push(entry);
+        if self.undo_stack.len() > 200 {
+            let overflow = self.undo_stack.len() - 200;
+            self.undo_stack.drain(0..overflow);
+        }
+    }
+
+    fn finish_pending_drag_undo(&mut self) {
+        if let Some(entry) = self.pending_drag_undo.take() {
+            self.push_undo_entry(entry);
         }
     }
 
@@ -2071,6 +2165,13 @@ fn title_case(input: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn matches_undo_key(key: &keyboard::Key) -> bool {
+    match key.as_ref() {
+        keyboard::Key::Character(character) => character.eq_ignore_ascii_case("z"),
+        _ => false,
+    }
 }
 
 fn sidecar_path_for_image(path: &Path) -> PathBuf {
