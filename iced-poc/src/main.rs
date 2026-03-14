@@ -105,6 +105,9 @@ enum Message {
         generation: u64,
         result: Result<RenderedPreview, String>,
     },
+    ThumbnailsRendered {
+        results: Vec<(usize, Result<image::Handle, String>)>,
+    },
 }
 
 struct App {
@@ -259,6 +262,7 @@ struct CardAnimation {
 impl App {
     fn new() -> (Self, Task<Message>) {
         let samples = load_samples();
+        let initial_thumbnail_indices = (0..samples.len()).collect::<Vec<_>>();
         let initial_selected_indices = if samples.is_empty() {
             BTreeSet::new()
         } else {
@@ -271,49 +275,58 @@ impl App {
             None
         };
 
-        (
-            Self {
-                route: Route::Home,
-                samples,
-                selected_index: 0,
-                selected_indices: initial_selected_indices,
-                shift_pressed: false,
-                basic_card: CardAnimation {
-                    expanded: true,
-                    progress: 1.0,
-                },
-                curves_card: CardAnimation {
-                    expanded: false,
-                    progress: 0.0,
-                },
-                color_card: CardAnimation {
-                    expanded: false,
-                    progress: 0.0,
-                },
-                details_card: CardAnimation {
-                    expanded: false,
-                    progress: 0.0,
-                },
-                effects_card: CardAnimation {
-                    expanded: false,
-                    progress: 0.0,
-                },
-                active_curve_channel: CurveChannel::Luma,
-                active_hsl_band: HslBand::Reds,
-                active_color_grading_zone: ColorGradingZone::Midtones,
-                current_folder: None,
-                is_loading: false,
-                status_message,
-                basic_adjustments: BasicAdjustments::default(),
-                lut_browser: LutBrowserState::default(),
-                rendered_preview: None,
-                preview_generation: 0,
-                is_rendering_preview: false,
-                pending_preview_quality: None,
-                renderer,
+        let mut app = Self {
+            route: Route::Home,
+            samples,
+            selected_index: 0,
+            selected_indices: initial_selected_indices,
+            shift_pressed: false,
+            basic_card: CardAnimation {
+                expanded: true,
+                progress: 1.0,
             },
-            Task::done(Message::ResetBasicAdjustments),
-        )
+            curves_card: CardAnimation {
+                expanded: false,
+                progress: 0.0,
+            },
+            color_card: CardAnimation {
+                expanded: false,
+                progress: 0.0,
+            },
+            details_card: CardAnimation {
+                expanded: false,
+                progress: 0.0,
+            },
+            effects_card: CardAnimation {
+                expanded: false,
+                progress: 0.0,
+            },
+            active_curve_channel: CurveChannel::Luma,
+            active_hsl_band: HslBand::Reds,
+            active_color_grading_zone: ColorGradingZone::Midtones,
+            current_folder: None,
+            is_loading: false,
+            status_message,
+            basic_adjustments: BasicAdjustments::default(),
+            lut_browser: LutBrowserState::default(),
+            rendered_preview: None,
+            preview_generation: 0,
+            is_rendering_preview: false,
+            pending_preview_quality: None,
+            renderer,
+        };
+
+        if let Some(sample) = app.samples.first() {
+            app.basic_adjustments = sample.adjustments.clone();
+        }
+
+        let task = if initial_thumbnail_indices.is_empty() {
+            Task::none()
+        } else {
+            app.request_thumbnail_render(initial_thumbnail_indices)
+        };
+
+        (app, task)
     }
 
     fn theme(&self) -> Theme {
@@ -340,6 +353,13 @@ impl App {
             Message::EnterEditor => {
                 if !self.samples.is_empty() {
                     self.route = Route::Editor;
+                    self.basic_adjustments = self
+                        .samples
+                        .get(self.selected_index)
+                        .map(|sample| sample.adjustments.clone())
+                        .unwrap_or_default();
+                    self.rendered_preview = None;
+                    return self.request_preview_render(PreviewQuality::Full);
                 }
             }
             Message::BackToHome => {
@@ -389,6 +409,12 @@ impl App {
                                     .unwrap_or_default()
                             ))
                         };
+                        if !self.samples.is_empty() {
+                            return Task::batch(vec![
+                                self.request_preview_render(PreviewQuality::Full),
+                                self.request_thumbnail_render((0..self.samples.len()).collect()),
+                            ]);
+                        }
                     }
                     Err(error) => {
                         self.status_message = Some(error);
@@ -867,7 +893,10 @@ impl App {
                 if generation == self.preview_generation {
                     match result {
                         Ok(rendered) => {
-                            self.rendered_preview = Some(rendered.handle);
+                            self.rendered_preview = Some(rendered.handle.clone());
+                            if let Some(sample) = self.samples.get_mut(self.selected_index) {
+                                sample.thumbnail = rendered.handle.clone();
+                            }
                             self.status_message = Some(if rendered.changed {
                                 "Preview updated.".to_string()
                             } else {
@@ -881,6 +910,15 @@ impl App {
                     self.is_rendering_preview = false;
                     if let Some(quality) = self.pending_preview_quality.take() {
                         return self.start_preview_render(quality);
+                    }
+                }
+            }
+            Message::ThumbnailsRendered { results } => {
+                for (index, result) in results {
+                    if let Some(sample) = self.samples.get_mut(index) {
+                        if let Ok(handle) = result {
+                            sample.thumbnail = handle;
+                        }
                     }
                 }
             }
@@ -1629,15 +1667,21 @@ impl App {
     }
 
     fn request_preview_render(&mut self, quality: PreviewQuality) -> Task<Message> {
+        let thumbnail_task = if matches!(quality, PreviewQuality::Full) {
+            self.request_selected_thumbnail_render()
+        } else {
+            Task::none()
+        };
+
         if self.is_rendering_preview {
             self.pending_preview_quality = Some(
                 self.pending_preview_quality
                     .map_or(quality, |pending| pending.max(quality)),
             );
-            return Task::none();
+            return thumbnail_task;
         }
 
-        self.start_preview_render(quality)
+        Task::batch(vec![self.start_preview_render(quality), thumbnail_task])
     }
 
     fn start_preview_render(&mut self, quality: PreviewQuality) -> Task<Message> {
@@ -1702,6 +1746,55 @@ impl App {
             },
             |message| message,
         )
+    }
+
+    fn request_thumbnail_render(&self, indices: Vec<usize>) -> Task<Message> {
+        let Some(renderer) = self.renderer.clone() else {
+            return Task::none();
+        };
+
+        let jobs = indices
+            .into_iter()
+            .filter_map(|index| {
+                self.samples.get(index).map(|sample| {
+                    (
+                        index,
+                        sample.interactive_preview_image.clone(),
+                        sample.adjustments.clone(),
+                        sample.is_raw,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if jobs.is_empty() {
+            return Task::none();
+        }
+
+        Task::perform(
+            async move {
+                let mut results = Vec::with_capacity(jobs.len());
+                for (index, base_image, adjustments, is_raw) in jobs {
+                    let rendered = renderer.render(base_image.as_ref(), &adjustments, is_raw);
+                    let result = rendered.map(|image| {
+                        let thumbnail = resize_for_bound(&image, 320);
+                        make_rgba_handle(&thumbnail)
+                    });
+                    results.push((index, result));
+                }
+                Message::ThumbnailsRendered { results }
+            },
+            |message| message,
+        )
+    }
+
+    fn request_selected_thumbnail_render(&self) -> Task<Message> {
+        let indices = if self.selected_indices.is_empty() {
+            vec![self.selected_index]
+        } else {
+            self.selected_indices.iter().copied().collect()
+        };
+        self.request_thumbnail_render(indices)
     }
 }
 
