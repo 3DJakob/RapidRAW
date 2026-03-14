@@ -52,6 +52,7 @@ enum Message {
     FolderLoaded(Result<LoadedFolder, String>),
     SelectImage(usize),
     NavigateSelection(i32),
+    SelectAllImages,
     ModifiersChanged(iced::keyboard::Modifiers),
     UndoRequested,
     AnimationFrame(Instant),
@@ -445,6 +446,11 @@ impl App {
                 Some(Message::UndoRequested)
             }
             iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
+                if modifiers.command() && matches_select_all_key(&key) =>
+            {
+                Some(Message::SelectAllImages)
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. })
                 if !modifiers.command() && !modifiers.alt() && !modifiers.control() =>
             {
                 rating_from_key(&key)
@@ -546,6 +552,19 @@ impl App {
             }
             Message::ModifiersChanged(modifiers) => {
                 self.shift_pressed = modifiers.shift();
+            }
+            Message::SelectAllImages => {
+                self.finish_pending_drag_undo();
+                if self.route == Route::Editor && !self.samples.is_empty() {
+                    self.selected_indices = (0..self.samples.len()).collect();
+                    self.selected_index = 0;
+                    self.basic_adjustments = self.samples[0].adjustments.clone();
+                    self.rendered_preview = None;
+                    self.pending_preview_quality = None;
+                    self.status_message =
+                        Some(format!("Selected {} images.", self.samples.len()));
+                    return self.request_preview_render(PreviewQuality::Full);
+                }
             }
             Message::SetRating(rating) => {
                 self.finish_pending_drag_undo();
@@ -2671,6 +2690,13 @@ fn title_case(input: &str) -> String {
 fn matches_undo_key(key: &keyboard::Key) -> bool {
     match key.as_ref() {
         keyboard::Key::Character(character) => character.eq_ignore_ascii_case("z"),
+        _ => false,
+    }
+}
+
+fn matches_select_all_key(key: &keyboard::Key) -> bool {
+    match key.as_ref() {
+        keyboard::Key::Character(character) => character.eq_ignore_ascii_case("a"),
         _ => false,
     }
 }
