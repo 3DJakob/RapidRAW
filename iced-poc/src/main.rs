@@ -1604,14 +1604,27 @@ impl App {
         let content: Element<'a, Message> = if sample.rating > 0 {
             let base: Element<'a, Message> = card.into();
             let badge: Element<'a, Message> = container(
-                row![
-                    app_icon(AppIcon::Star, 11.0, Color::from_rgb8(0xf8, 0xe1, 0x6c)),
-                    text(sample.rating.to_string()).size(11).color(Color::WHITE),
-                ]
-                .spacing(4)
-                .align_y(iced::alignment::Vertical::Center),
+                container(
+                    row![
+                        text(sample.rating.to_string()).size(11).color(Color::WHITE),
+                        app_icon(AppIcon::Star, 11.0, Color::WHITE),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::alignment::Vertical::Center),
+                )
+                .padding([4, 8])
+                .style(|_| container::Style {
+                    text_color: Some(Color::WHITE),
+                    background: Some(Background::Color(Color::from_rgba8(0x0d, 0x12, 0x1b, 0.58))),
+                    border: Border::default().rounded(999.0),
+                    ..container::Style::default()
+                })
+                .align_x(iced::alignment::Horizontal::Right)
+                .align_y(iced::alignment::Vertical::Top),
             )
-            .padding([4, 8])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding([10, 10])
             .align_x(iced::alignment::Horizontal::Right)
             .align_y(iced::alignment::Vertical::Top)
             .into();
