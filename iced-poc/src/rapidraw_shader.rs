@@ -153,7 +153,7 @@ struct MainPipeline {
 impl MainPipeline {
     fn new(context: &GpuContext) -> Result<Self, String> {
         let device = &context.device;
-        const MAX_MASKS: u32 = 9;
+        const MAX_MASKS: u32 = 8;
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RapidRAW Main Shader"),
@@ -225,7 +225,7 @@ impl MainPipeline {
             count: None,
         });
 
-        for binding in [5 + MAX_MASKS, 6 + MAX_MASKS, 7 + MAX_MASKS] {
+        for binding in [5 + MAX_MASKS, 6 + MAX_MASKS, 7 + MAX_MASKS, 8 + MAX_MASKS] {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -239,7 +239,7 @@ impl MainPipeline {
         }
 
         entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 8 + MAX_MASKS,
+            binding: 9 + MAX_MASKS,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -249,7 +249,7 @@ impl MainPipeline {
             count: None,
         });
         entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 9 + MAX_MASKS,
+            binding: 10 + MAX_MASKS,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
@@ -413,7 +413,7 @@ impl MainPipeline {
         let all_adjustments = build_all_adjustments(adjustments, is_raw);
         queue.write_buffer(&self.adjustments_buffer, 0, bytemuck::bytes_of(&all_adjustments));
 
-        const MAX_MASKS: usize = 9;
+        const MAX_MASKS: usize = 8;
         let mut entries = vec![
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -437,15 +437,15 @@ impl MainPipeline {
         }
 
         entries.push(wgpu::BindGroupEntry {
-            binding: 12,
+            binding: 11,
             resource: wgpu::BindingResource::TextureView(&self.dummy_lut_view),
         });
         entries.push(wgpu::BindGroupEntry {
-            binding: 13,
+            binding: 12,
             resource: wgpu::BindingResource::Sampler(&self.lut_sampler),
         });
 
-        for binding in [14, 15, 16] {
+        for binding in [13, 14, 15, 16] {
             entries.push(wgpu::BindGroupEntry {
                 binding,
                 resource: wgpu::BindingResource::TextureView(&self.dummy_blur_view),
