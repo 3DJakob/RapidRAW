@@ -147,6 +147,7 @@ struct App {
     selected_index: usize,
     selected_indices: BTreeSet<usize>,
     shift_pressed: bool,
+    command_pressed: bool,
     basic_card: CardAnimation,
     curves_card: CardAnimation,
     color_card: CardAnimation,
@@ -518,6 +519,7 @@ impl App {
             selected_index: 0,
             selected_indices: initial_selected_indices,
             shift_pressed: false,
+            command_pressed: false,
             basic_card: CardAnimation {
                 expanded: true,
                 progress: 1.0,
@@ -693,6 +695,7 @@ impl App {
             }
             Message::ModifiersChanged(modifiers) => {
                 self.shift_pressed = modifiers.shift();
+                self.command_pressed = modifiers.command();
             }
             Message::SelectSidebarPage(page) => {
                 self.sidebar_page = page;
@@ -937,6 +940,11 @@ impl App {
                 self.finish_pending_drag_undo();
                 if index < self.samples.len() {
                     if self.shift_pressed {
+                        self.selected_indices.clear();
+                        let start = self.selected_index.min(index);
+                        let end = self.selected_index.max(index);
+                        self.selected_indices.extend(start..=end);
+                    } else if self.command_pressed {
                         self.selected_indices.insert(index);
                     } else {
                         self.selected_indices.clear();
