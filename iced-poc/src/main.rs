@@ -2720,16 +2720,16 @@ impl App {
     fn view_right_panel(&self) -> Element<'_, Message> {
         let top_tabs = row![
             sidebar_tab_button(
-                AppIcon::Crop,
-                self.sidebar_page == SidebarPage::Crop,
-                Message::SelectSidebarPage(SidebarPage::Crop),
-                "Crop",
-            ),
-            sidebar_tab_button(
                 AppIcon::SlidersHorizontal,
                 self.sidebar_page == SidebarPage::Adjustments,
                 Message::SelectSidebarPage(SidebarPage::Adjustments),
                 "Adjustments",
+            ),
+            sidebar_tab_button(
+                AppIcon::Crop,
+                self.sidebar_page == SidebarPage::Crop,
+                Message::SelectSidebarPage(SidebarPage::Crop),
+                "Crop",
             ),
             sidebar_tab_button(
                 AppIcon::Share,
