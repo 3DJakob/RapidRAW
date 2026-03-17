@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 iced = { version = "0.13", features = ["image", "advanced", "canvas"] }
 image = "0.25.9"
+imageproc = "0.25.0"
 lucide-icons = { version = "0.575.0", features = ["iced"] }
 rawler = { path = "../src-tauri/rawler/rawler" }
 rfd = "0.15.4"

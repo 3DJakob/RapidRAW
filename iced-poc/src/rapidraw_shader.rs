@@ -22,6 +22,14 @@ pub struct CurvePoint {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CropRect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HueSatLum {
     pub hue: f32,
     pub saturation: f32,
@@ -139,6 +147,12 @@ pub fn default_curve_points() -> Vec<CurvePoint> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicAdjustments {
+    pub aspect_ratio: Option<f32>,
+    pub crop: Option<CropRect>,
+    pub rotation: f32,
+    pub flip_horizontal: bool,
+    pub flip_vertical: bool,
+    pub orientation_steps: u8,
     pub exposure: f32,
     pub brightness: f32,
     pub contrast: f32,
@@ -183,6 +197,12 @@ pub struct BasicAdjustments {
 impl Default for BasicAdjustments {
     fn default() -> Self {
         Self {
+            aspect_ratio: None,
+            crop: None,
+            rotation: 0.0,
+            flip_horizontal: false,
+            flip_vertical: false,
+            orientation_steps: 0,
             exposure: 0.0,
             brightness: 0.0,
             contrast: 0.0,

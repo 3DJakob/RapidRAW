@@ -1,8 +1,10 @@
 mod rapidraw_shader;
 
 use ::image::{
-    DynamicImage, GenericImageView, RgbImage, RgbaImage, imageops::FilterType, open as open_image,
+    DynamicImage, GenericImageView, RgbImage, Rgba, RgbaImage, imageops::FilterType,
+    open as open_image,
 };
+use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 use iced::widget::{
     Space, button, canvas, column, container, image, mouse_area, row, scrollable, slider, stack,
     text, text_input, tooltip,
@@ -13,7 +15,7 @@ use iced::{
 };
 use lucide_icons::{Icon as LucideIcon, LUCIDE_FONT_BYTES};
 use rapidraw_shader::{
-    BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CurvePoint,
+    BasicAdjustments, ColorCalibrationSettingsUi, ColorGradingSettingsUi, CropRect, CurvePoint,
     CurvesSettings, HslSettings, HueSatLum, RapidRawRenderer, ToneMapper, default_curve_points,
     parse_lut_metadata,
 };
@@ -30,6 +32,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+const BASE_CROP_RATIO: f32 = 1.618;
+const CROP_RATIO_TOLERANCE: f32 = 0.01;
 
 fn main() -> iced::Result {
     application("RapidRAW Iced POC Preview", App::update, App::view)
@@ -98,6 +103,21 @@ enum Message {
     HoverLut(Option<usize>),
     ApplyLutFromBrowser(usize),
     SelectSidebarPage(SidebarPage),
+    CropPresetSelected(CropPresetKind),
+    CropCustomWidthChanged(String),
+    CropCustomHeightChanged(String),
+    ApplyCustomCropRatio,
+    InvertCropAspectRatio,
+    RotateLeft,
+    RotateRight,
+    ToggleFlipHorizontal,
+    ToggleFlipVertical,
+    CropRotationChanged(f32),
+    ApplyRulerRotation(f32),
+    ToggleCropRuler,
+    ResetCropRotation,
+    CropOverlayChanged(CropRect),
+    ResetCropTransform,
     ExportFormatChanged(ExportFileFormat),
     ExportJpegQualityChanged(f32),
     ExportResizeEnabledChanged(bool),
@@ -137,7 +157,7 @@ enum Message {
         result: Result<RenderedPreview, String>,
     },
     ThumbnailsRendered {
-        results: Vec<(usize, Result<image::Handle, String>)>,
+        results: Vec<(usize, Result<RenderedThumbnail, String>)>,
     },
 }
 
@@ -160,8 +180,12 @@ struct App {
     is_loading: bool,
     status_message: Option<String>,
     basic_adjustments: BasicAdjustments,
+    crop_custom_width: String,
+    crop_custom_height: String,
+    crop_ruler_active: bool,
     lut_browser: LutBrowserState,
     rendered_preview: Option<image::Handle>,
+    rendered_preview_size: Option<(u32, u32)>,
     preview_generation: u64,
     is_rendering_preview: bool,
     pending_preview_quality: Option<PreviewQuality>,
@@ -193,8 +217,16 @@ enum UndoBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarPage {
+    Crop,
     Adjustments,
     Export,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CropPresetKind {
+    Free,
+    Original,
+    Ratio(f32),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,6 +361,9 @@ enum Route {
 struct SampleImage {
     name: String,
     path: PathBuf,
+    source_width: u32,
+    source_height: u32,
+    thumbnail_dimensions: (u32, u32),
     interactive_preview_image: Arc<DynamicImage>,
     full_preview_image: Arc<DynamicImage>,
     preview: image::Handle,
@@ -348,7 +383,17 @@ struct LoadedFolder {
 #[derive(Debug, Clone)]
 struct RenderedPreview {
     handle: image::Handle,
+    width: u32,
+    height: u32,
     changed: bool,
+    updates_thumbnail: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RenderedThumbnail {
+    handle: image::Handle,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -358,15 +403,45 @@ struct ThumbnailCanvas {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct CropOverlay {
+    crop: CropRect,
+    image_size: (u32, u32),
+    locked_ratio: Option<f32>,
+    ruler_active: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CropOverlayState {
+    drag_mode: Option<CropDragMode>,
+    last_position: Option<Point>,
+    ruler_start: Option<Point>,
+    ruler_end: Option<Point>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CropDragMode {
+    Move,
+    Handle(usize),
+    Ruler,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum AppIcon {
     ArrowLeft,
     Check,
     ChevronDown,
     ChevronUp,
+    Crop,
     SlidersHorizontal,
     Share,
     FolderOpen,
     RotateCcw,
+    RotateCw,
+    Ruler,
+    FlipHorizontal,
+    FlipVertical,
+    RectangleHorizontal,
+    RectangleVertical,
     Star,
     X,
 }
@@ -437,6 +512,294 @@ impl<Message> canvas::Program<Message> for ThumbnailCanvas {
         );
 
         vec![frame.into_geometry()]
+    }
+}
+
+impl canvas::Program<Message> for CropOverlay {
+    type State = CropOverlayState;
+
+    fn update(
+        &self,
+        state: &mut Self::State,
+        event: canvas::Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> (canvas::event::Status, Option<Message>) {
+        let Some(position) = cursor.position_in(bounds) else {
+            if matches!(
+                event,
+                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            ) {
+                state.drag_mode = None;
+                state.last_position = None;
+                return (
+                    canvas::event::Status::Captured,
+                    Some(Message::CommitPreviewRender),
+                );
+            }
+            return (canvas::event::Status::Ignored, None);
+        };
+
+        let image_rect = fitted_rect(bounds.size(), self.image_size);
+        let crop_rect = crop_overlay_rect_in_bounds(self.crop, self.image_size, bounds.size());
+
+        if self.ruler_active {
+            match event {
+                canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                    if point_in_rect(position, image_rect) {
+                        let clamped = clamp_point_to_rect(position, image_rect);
+                        state.drag_mode = Some(CropDragMode::Ruler);
+                        state.last_position = Some(clamped);
+                        state.ruler_start = Some(clamped);
+                        state.ruler_end = Some(clamped);
+                        return (canvas::event::Status::Captured, None);
+                    }
+                    return (canvas::event::Status::Ignored, None);
+                }
+                canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                    if matches!(state.drag_mode, Some(CropDragMode::Ruler)) {
+                        let clamped = clamp_point_to_rect(position, image_rect);
+                        state.last_position = Some(clamped);
+                        state.ruler_end = Some(clamped);
+                        return (canvas::event::Status::Captured, None);
+                    }
+                }
+                canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                    if matches!(state.drag_mode, Some(CropDragMode::Ruler)) {
+                        state.drag_mode = None;
+                        state.last_position = None;
+                        let rotation = state
+                            .ruler_start
+                            .zip(state.ruler_end)
+                            .and_then(|(start, end)| ruler_rotation_from_line(start, end));
+                        state.ruler_start = None;
+                        state.ruler_end = None;
+                        return (
+                            canvas::event::Status::Captured,
+                            rotation.map(Message::ApplyRulerRotation),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        match event {
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let Some(handle_index) = crop_handle_rects(crop_rect)
+                    .iter()
+                    .position(|handle| point_in_rect(position, *handle))
+                {
+                    state.drag_mode = Some(CropDragMode::Handle(handle_index));
+                    state.last_position = Some(position);
+                    return (canvas::event::Status::Captured, None);
+                }
+
+                if point_in_rect(position, crop_rect) {
+                    state.drag_mode = Some(CropDragMode::Move);
+                    state.last_position = Some(position);
+                    return (canvas::event::Status::Captured, None);
+                }
+
+                (canvas::event::Status::Ignored, None)
+            }
+            canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let Some(last_position) = state.last_position else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+                let Some(drag_mode) = state.drag_mode else {
+                    return (canvas::event::Status::Ignored, None);
+                };
+
+                let delta = Point::new(position.x - last_position.x, position.y - last_position.y);
+                let updated_rect = match drag_mode {
+                    CropDragMode::Move => move_crop_overlay_rect(crop_rect, image_rect, delta),
+                    CropDragMode::Handle(handle) => {
+                        resize_crop_overlay_rect(
+                            crop_rect,
+                            image_rect,
+                            handle,
+                            delta,
+                            self.locked_ratio,
+                        )
+                    }
+                    CropDragMode::Ruler => crop_rect,
+                };
+                state.last_position = Some(position);
+                return (
+                    canvas::event::Status::Captured,
+                    Some(Message::CropOverlayChanged(
+                        crop_rect_from_overlay_rect(updated_rect, self.image_size, bounds.size()),
+                    )),
+                );
+            }
+            canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.drag_mode.is_some() {
+                    state.drag_mode = None;
+                    state.last_position = None;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::CommitPreviewRender),
+                    );
+                }
+                (canvas::event::Status::Ignored, None)
+            }
+            _ => (canvas::event::Status::Ignored, None),
+        }
+    }
+
+    fn draw(
+        &self,
+        state: &Self::State,
+        renderer: &iced::Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        let image_rect = fitted_rect(bounds.size(), self.image_size);
+
+        let scale_x = image_rect.width / self.image_size.0.max(1) as f32;
+        let scale_y = image_rect.height / self.image_size.1.max(1) as f32;
+        let crop_rect = Rectangle {
+            x: image_rect.x + self.crop.x * scale_x,
+            y: image_rect.y + self.crop.y * scale_y,
+            width: self.crop.width * scale_x,
+            height: self.crop.height * scale_y,
+        };
+
+        let dim_color = Color::from_rgba8(0x05, 0x09, 0x12, 0.55);
+        let top = canvas::Path::rectangle(
+            Point::new(image_rect.x, image_rect.y),
+            Size::new(image_rect.width, (crop_rect.y - image_rect.y).max(0.0)),
+        );
+        let bottom = canvas::Path::rectangle(
+            Point::new(image_rect.x, (crop_rect.y + crop_rect.height).min(image_rect.y + image_rect.height)),
+            Size::new(
+                image_rect.width,
+                (image_rect.y + image_rect.height - crop_rect.y - crop_rect.height).max(0.0),
+            ),
+        );
+        let left = canvas::Path::rectangle(
+            Point::new(image_rect.x, crop_rect.y.max(image_rect.y)),
+            Size::new((crop_rect.x - image_rect.x).max(0.0), crop_rect.height.max(0.0)),
+        );
+        let right = canvas::Path::rectangle(
+            Point::new((crop_rect.x + crop_rect.width).min(image_rect.x + image_rect.width), crop_rect.y.max(image_rect.y)),
+            Size::new(
+                (image_rect.x + image_rect.width - crop_rect.x - crop_rect.width).max(0.0),
+                crop_rect.height.max(0.0),
+            ),
+        );
+        for path in [&top, &bottom, &left, &right] {
+            frame.fill(path, dim_color);
+        }
+
+        let crop_outline = canvas::Path::rectangle(
+            Point::new(crop_rect.x, crop_rect.y),
+            Size::new(crop_rect.width, crop_rect.height),
+        );
+        frame.stroke(
+            &crop_outline,
+            canvas::Stroke::default()
+                .with_color(Color::WHITE)
+                .with_width(1.5),
+        );
+
+        for step in [1.0_f32 / 3.0, 2.0 / 3.0] {
+            let vertical = canvas::Path::line(
+                Point::new(crop_rect.x + crop_rect.width * step, crop_rect.y),
+                Point::new(crop_rect.x + crop_rect.width * step, crop_rect.y + crop_rect.height),
+            );
+            let horizontal = canvas::Path::line(
+                Point::new(crop_rect.x, crop_rect.y + crop_rect.height * step),
+                Point::new(crop_rect.x + crop_rect.width, crop_rect.y + crop_rect.height * step),
+            );
+            frame.stroke(
+                &vertical,
+                canvas::Stroke::default()
+                    .with_color(Color::from_rgba8(0xff, 0xff, 0xff, 0.30))
+                    .with_width(1.0),
+            );
+            frame.stroke(
+                &horizontal,
+                canvas::Stroke::default()
+                    .with_color(Color::from_rgba8(0xff, 0xff, 0xff, 0.30))
+                    .with_width(1.0),
+            );
+        }
+
+        for handle in crop_handle_rects(crop_rect) {
+            let path = canvas::Path::rounded_rectangle(
+                Point::new(handle.x, handle.y),
+                Size::new(handle.width, handle.height),
+                4.0.into(),
+            );
+            frame.fill(&path, Color::WHITE);
+            frame.stroke(
+                &path,
+                canvas::Stroke::default()
+                    .with_color(Color::from_rgb8(0x0d, 0x12, 0x1b))
+                    .with_width(1.0),
+            );
+        }
+
+        if let Some((start, end)) = state.ruler_start.zip(state.ruler_end) {
+            let line = canvas::Path::line(start, end);
+            frame.stroke(
+                &line,
+                canvas::Stroke::default()
+                    .with_color(Color::from_rgb8(0xf8, 0xfb, 0xff))
+                    .with_width(2.0),
+            );
+
+            for point in [start, end] {
+                let marker =
+                    canvas::Path::circle(point, 5.0);
+                frame.fill(&marker, Color::from_rgb8(0xf8, 0xfb, 0xff));
+                frame.stroke(
+                    &marker,
+                    canvas::Stroke::default()
+                        .with_color(Color::from_rgb8(0x0d, 0x12, 0x1b))
+                        .with_width(1.5),
+                );
+            }
+        }
+
+        vec![frame.into_geometry()]
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &Self::State,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if matches!(state.drag_mode, Some(CropDragMode::Ruler)) {
+            return mouse::Interaction::Crosshair;
+        }
+
+        if state.drag_mode.is_some() {
+            return mouse::Interaction::Pointer;
+        }
+
+        let Some(position) = cursor.position_in(bounds) else {
+            return mouse::Interaction::default();
+        };
+        let image_rect = fitted_rect(bounds.size(), self.image_size);
+        if self.ruler_active && point_in_rect(position, image_rect) {
+            return mouse::Interaction::Crosshair;
+        }
+        let crop_rect = crop_overlay_rect_in_bounds(self.crop, self.image_size, bounds.size());
+        if point_in_rect(position, crop_rect)
+            || crop_handle_rects(crop_rect)
+                .iter()
+                .any(|handle| point_in_rect(position, *handle))
+        {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
     }
 }
 
@@ -547,8 +910,12 @@ impl App {
             is_loading: false,
             status_message,
             basic_adjustments: BasicAdjustments::default(),
+            crop_custom_width: String::new(),
+            crop_custom_height: String::new(),
+            crop_ruler_active: false,
             lut_browser: LutBrowserState::default(),
             rendered_preview: None,
+            rendered_preview_size: None,
             preview_generation: 0,
             is_rendering_preview: false,
             pending_preview_quality: None,
@@ -563,6 +930,7 @@ impl App {
 
         if let Some(sample) = app.samples.first() {
             app.basic_adjustments = sample.adjustments.clone();
+            app.sync_crop_custom_inputs();
         }
 
         let task = if initial_thumbnail_indices.is_empty() {
@@ -624,16 +992,20 @@ impl App {
                         .get(self.selected_index)
                         .map(|sample| sample.adjustments.clone())
                         .unwrap_or_default();
+                    self.sync_crop_custom_inputs();
                     self.rendered_preview = None;
+                    self.rendered_preview_size = None;
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
             Message::BackToHome => {
                 self.finish_pending_drag_undo();
+                self.crop_ruler_active = false;
                 self.route = Route::Home;
             }
             Message::OpenFolder => {
                 self.finish_pending_drag_undo();
+                self.crop_ruler_active = false;
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.is_loading = true;
                     self.status_message =
@@ -654,12 +1026,14 @@ impl App {
                             BTreeSet::from([0])
                         };
                         self.rendered_preview = None;
+                        self.rendered_preview_size = None;
                         self.pending_preview_quality = None;
                         self.basic_adjustments = self
                             .samples
                             .first()
                             .map(|sample| sample.adjustments.clone())
                             .unwrap_or_default();
+                        self.sync_crop_custom_inputs();
                         self.route = if self.samples.is_empty() {
                             Route::Home
                         } else {
@@ -698,7 +1072,127 @@ impl App {
                 self.command_pressed = modifiers.command();
             }
             Message::SelectSidebarPage(page) => {
-                self.sidebar_page = page;
+                if self.sidebar_page != page {
+                    self.finish_pending_drag_undo();
+                    if self.sidebar_page == SidebarPage::Crop && page != SidebarPage::Crop {
+                        self.crop_ruler_active = false;
+                    }
+                    self.sidebar_page = page;
+                    self.rendered_preview = None;
+                    self.rendered_preview_size = None;
+                    if !self.samples.is_empty() {
+                        return self.request_preview_render(PreviewQuality::Full);
+                    }
+                }
+            }
+            Message::CropPresetSelected(preset) => {
+                let new_ratio = match preset {
+                    CropPresetKind::Free => None,
+                    CropPresetKind::Original => self.active_original_crop_ratio(),
+                    CropPresetKind::Ratio(value) => Some(value),
+                };
+                self.apply_crop_ratio_to_selected(new_ratio);
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::CropCustomWidthChanged(value) => {
+                self.crop_custom_width = value;
+            }
+            Message::CropCustomHeightChanged(value) => {
+                self.crop_custom_height = value;
+            }
+            Message::ApplyCustomCropRatio => {
+                if let Some(new_ratio) = parse_custom_crop_ratio(
+                    &self.crop_custom_width,
+                    &self.crop_custom_height,
+                ) {
+                    self.apply_crop_ratio_to_selected(Some(new_ratio));
+                    return self.request_preview_render(PreviewQuality::Full);
+                }
+            }
+            Message::InvertCropAspectRatio => {
+                if let Some(ratio) = self.basic_adjustments.aspect_ratio
+                    && ratio > 0.0
+                {
+                    self.apply_crop_ratio_to_selected(Some(1.0 / ratio));
+                    return self.request_preview_render(PreviewQuality::Full);
+                }
+            }
+            Message::RotateLeft => {
+                self.rotate_selected_images(-1);
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::RotateRight => {
+                self.rotate_selected_images(1);
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::ToggleFlipHorizontal => {
+                let value = !self.basic_adjustments.flip_horizontal;
+                self.basic_adjustments.flip_horizontal = value;
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.flip_horizontal = value;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::ToggleFlipVertical => {
+                let value = !self.basic_adjustments.flip_vertical;
+                self.basic_adjustments.flip_vertical = value;
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.flip_vertical = value;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::CropRotationChanged(value) => {
+                self.basic_adjustments.rotation = value;
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.rotation = value;
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ApplyRulerRotation(value) => {
+                let value = (self.basic_adjustments.rotation + value).clamp(-45.0, 45.0);
+                self.crop_ruler_active = false;
+                self.basic_adjustments.rotation = value;
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.rotation = value;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::ToggleCropRuler => {
+                self.crop_ruler_active = !self.crop_ruler_active;
+            }
+            Message::ResetCropRotation => {
+                self.crop_ruler_active = false;
+                self.basic_adjustments.rotation = 0.0;
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.rotation = 0.0;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
+            }
+            Message::CropOverlayChanged(crop) => {
+                self.basic_adjustments.crop = Some(crop);
+                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
+                    adjustments.crop = Some(crop);
+                });
+                return self.request_preview_render(PreviewQuality::Interactive);
+            }
+            Message::ResetCropTransform => {
+                self.crop_ruler_active = false;
+                self.basic_adjustments.aspect_ratio = None;
+                self.basic_adjustments.crop = None;
+                self.basic_adjustments.rotation = 0.0;
+                self.basic_adjustments.flip_horizontal = false;
+                self.basic_adjustments.flip_vertical = false;
+                self.basic_adjustments.orientation_steps = 0;
+                self.sync_crop_custom_inputs();
+                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
+                    adjustments.aspect_ratio = None;
+                    adjustments.crop = None;
+                    adjustments.rotation = 0.0;
+                    adjustments.flip_horizontal = false;
+                    adjustments.flip_vertical = false;
+                    adjustments.orientation_steps = 0;
+                });
+                return self.request_preview_render(PreviewQuality::Full);
             }
             Message::ExportFormatChanged(format) => {
                 self.export_settings.file_format = format;
@@ -831,7 +1325,9 @@ impl App {
                     self.selected_indices = (0..self.samples.len()).collect();
                     self.selected_index = 0;
                     self.basic_adjustments = self.samples[0].adjustments.clone();
+                    self.sync_crop_custom_inputs();
                     self.rendered_preview = None;
+                    self.rendered_preview_size = None;
                     self.pending_preview_quality = None;
                     self.status_message = Some(format!("Selected {} images.", self.samples.len()));
                     return self.request_preview_render(PreviewQuality::Full);
@@ -881,6 +1377,7 @@ impl App {
                     }
                     if let Some(sample) = self.samples.get(self.selected_index) {
                         self.basic_adjustments = sample.adjustments.clone();
+                        self.sync_crop_custom_inputs();
                     }
                     self.lut_browser.hovered_index = None;
                     self.status_message = Some("Undid last adjustment.".to_string());
@@ -938,6 +1435,7 @@ impl App {
             }
             Message::SelectImage(index) => {
                 self.finish_pending_drag_undo();
+                self.crop_ruler_active = false;
                 if index < self.samples.len() {
                     if self.shift_pressed {
                         self.selected_indices.clear();
@@ -952,13 +1450,16 @@ impl App {
                     }
                     self.selected_index = index;
                     self.rendered_preview = None;
+                    self.rendered_preview_size = None;
                     self.pending_preview_quality = None;
                     self.basic_adjustments = self.samples[index].adjustments.clone();
+                    self.sync_crop_custom_inputs();
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
             Message::NavigateSelection(offset) => {
                 self.finish_pending_drag_undo();
+                self.crop_ruler_active = false;
                 if self.route == Route::Editor && !self.samples.is_empty() {
                     let next_index = (self.selected_index as i32 + offset)
                         .clamp(0, self.samples.len().saturating_sub(1) as i32)
@@ -969,8 +1470,10 @@ impl App {
                         self.selected_indices.insert(next_index);
                         self.selected_index = next_index;
                         self.rendered_preview = None;
+                        self.rendered_preview_size = None;
                         self.pending_preview_quality = None;
                         self.basic_adjustments = self.samples[next_index].adjustments.clone();
+                        self.sync_crop_custom_inputs();
                         return self.request_preview_render(PreviewQuality::Full);
                     }
                 }
@@ -1314,6 +1817,7 @@ impl App {
             }
             Message::ResetBasicAdjustments => {
                 self.basic_adjustments = BasicAdjustments::default();
+                self.sync_crop_custom_inputs();
                 self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
                     *adjustments = BasicAdjustments::default()
                 });
@@ -1488,7 +1992,10 @@ impl App {
                     match result {
                         Ok(rendered) => {
                             self.rendered_preview = Some(rendered.handle.clone());
-                            if let Some(sample) = self.samples.get_mut(self.selected_index) {
+                            self.rendered_preview_size = Some((rendered.width, rendered.height));
+                            if rendered.updates_thumbnail
+                                && let Some(sample) = self.samples.get_mut(self.selected_index)
+                            {
                                 if let image::Handle::Rgba {
                                     width,
                                     height,
@@ -1507,6 +2014,8 @@ impl App {
                                             &thumbnail,
                                             FILMSTRIP_IMAGE_RADIUS_PX,
                                         );
+                                        sample.thumbnail_dimensions =
+                                            (rendered.width, rendered.height);
                                     }
                                 }
                             }
@@ -1530,8 +2039,9 @@ impl App {
             Message::ThumbnailsRendered { results } => {
                 for (index, result) in results {
                     if let Some(sample) = self.samples.get_mut(index) {
-                        if let Ok(handle) = result {
-                            sample.thumbnail = handle;
+                        if let Ok(rendered) = result {
+                            sample.thumbnail = rendered.handle;
+                            sample.thumbnail_dimensions = (rendered.width, rendered.height);
                         }
                     }
                 }
@@ -1632,7 +2142,149 @@ impl App {
 
         if let Some(sample) = self.samples.get(self.selected_index) {
             self.basic_adjustments = sample.adjustments.clone();
+            self.sync_crop_custom_inputs();
         }
+    }
+
+    fn sync_crop_custom_inputs(&mut self) {
+        if let Some(ratio) = self.basic_adjustments.aspect_ratio {
+            let height = 100.0;
+            let width = ratio * height;
+            self.crop_custom_width = trim_ratio_value(width);
+            self.crop_custom_height = trim_ratio_value(height);
+        } else {
+            self.crop_custom_width.clear();
+            self.crop_custom_height.clear();
+        }
+    }
+
+    fn active_original_crop_ratio(&self) -> Option<f32> {
+        let sample = self.samples.get(self.selected_index)?;
+        effective_source_dimensions(
+            sample.source_width,
+            sample.source_height,
+            self.basic_adjustments.orientation_steps,
+        )
+        .map(|(width, height)| width as f32 / height.max(1) as f32)
+    }
+
+    fn apply_crop_ratio_to_selected(&mut self, new_ratio: Option<f32>) {
+        self.finish_pending_drag_undo();
+        let selected = if self.selected_indices.is_empty() {
+            vec![self.selected_index]
+        } else {
+            self.selected_indices.iter().copied().collect::<Vec<_>>()
+        };
+
+        let mut undo_changes = Vec::new();
+
+        for index in selected {
+            if let Some(sample) = self.samples.get_mut(index) {
+                let previous = sample.adjustments.clone();
+                sample.adjustments.aspect_ratio = new_ratio;
+                let dims = effective_source_dimensions(
+                    sample.source_width,
+                    sample.source_height,
+                    sample.adjustments.orientation_steps,
+                );
+                sample.adjustments.crop = match new_ratio {
+                    Some(_) => crop_rect_for_ratio(dims, new_ratio),
+                    None => full_crop_rect(dims),
+                };
+                if sample.adjustments != previous {
+                    undo_changes.push(UndoChange {
+                        index,
+                        adjustments: previous,
+                    });
+                }
+                if let Err(error) = save_sample_adjustments(sample) {
+                    self.status_message = Some(error);
+                }
+            }
+        }
+
+        if !undo_changes.is_empty() {
+            self.push_undo_entry(UndoEntry {
+                changes: undo_changes,
+            });
+        }
+
+        if let Some(sample) = self.samples.get(self.selected_index) {
+            self.basic_adjustments = sample.adjustments.clone();
+            self.sync_crop_custom_inputs();
+        }
+    }
+
+    fn rotate_selected_images(&mut self, direction: i32) {
+        self.finish_pending_drag_undo();
+        let selected = if self.selected_indices.is_empty() {
+            vec![self.selected_index]
+        } else {
+            self.selected_indices.iter().copied().collect::<Vec<_>>()
+        };
+        let mut undo_changes = Vec::new();
+
+        for index in selected {
+            if let Some(sample) = self.samples.get_mut(index) {
+                let previous = sample.adjustments.clone();
+                let increment = if direction >= 0 { 1 } else { 3 };
+                sample.adjustments.orientation_steps =
+                    ((sample.adjustments.orientation_steps as i32 + increment) % 4) as u8;
+                sample.adjustments.rotation = 0.0;
+                let dims = effective_source_dimensions(
+                    sample.source_width,
+                    sample.source_height,
+                    sample.adjustments.orientation_steps,
+                );
+                sample.adjustments.crop =
+                    crop_rect_for_ratio(dims, sample.adjustments.aspect_ratio);
+
+                if sample.adjustments != previous {
+                    undo_changes.push(UndoChange {
+                        index,
+                        adjustments: previous,
+                    });
+                }
+                if let Err(error) = save_sample_adjustments(sample) {
+                    self.status_message = Some(error);
+                }
+            }
+        }
+
+        if !undo_changes.is_empty() {
+            self.push_undo_entry(UndoEntry {
+                changes: undo_changes,
+            });
+        }
+
+        if let Some(sample) = self.samples.get(self.selected_index) {
+            self.basic_adjustments = sample.adjustments.clone();
+            self.sync_crop_custom_inputs();
+        }
+    }
+
+    fn crop_overlay_for_selected(&self) -> Option<CropOverlay> {
+        if self.sidebar_page != SidebarPage::Crop {
+            return None;
+        }
+
+        let sample = self.samples.get(self.selected_index)?;
+        let image_size = effective_source_dimensions(
+            sample.source_width,
+            sample.source_height,
+            self.basic_adjustments.orientation_steps,
+        )?;
+        let crop = self
+            .basic_adjustments
+            .crop
+            .or_else(|| full_crop_rect(Some(image_size)))?;
+
+        Some(CropOverlay {
+            crop,
+            image_size,
+            locked_ratio: self.basic_adjustments.aspect_ratio,
+            ruler_active: self.crop_ruler_active,
+        })
     }
 
     fn push_undo_entry(&mut self, entry: UndoEntry) {
@@ -1800,16 +2452,29 @@ impl App {
         .align_y(iced::alignment::Vertical::Center)
         .spacing(APP_SPACING);
 
-        let preview = container(
-            image(
-                self.rendered_preview
-                    .clone()
-                    .unwrap_or_else(|| selected.preview.clone()),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .content_fit(iced::ContentFit::Contain),
+        let preview_image: Element<'_, Message> = image(
+            self.rendered_preview
+                .clone()
+                .unwrap_or_else(|| selected.preview.clone()),
         )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .content_fit(iced::ContentFit::Contain)
+        .into();
+
+        let preview_content: Element<'_, Message> = if let Some(crop) = self.crop_overlay_for_selected() {
+            stack![
+                preview_image,
+                canvas::Canvas::new(crop)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+            ]
+            .into()
+        } else {
+            preview_image
+        };
+
+        let preview = container(preview_content)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(24)
@@ -1912,7 +2577,7 @@ impl App {
         } else {
             Color::from_rgb8(0x16, 0x1b, 0x25)
         };
-        let (width, height) = sample.full_preview_image.dimensions();
+        let (width, height) = sample.thumbnail_dimensions;
         let thumb_height = 92.0;
         let thumb_width = if height == 0 {
             thumb_height
@@ -2011,6 +2676,12 @@ impl App {
     fn view_right_panel(&self) -> Element<'_, Message> {
         let top_tabs = row![
             sidebar_tab_button(
+                AppIcon::Crop,
+                self.sidebar_page == SidebarPage::Crop,
+                Message::SelectSidebarPage(SidebarPage::Crop),
+                "Crop",
+            ),
+            sidebar_tab_button(
                 AppIcon::SlidersHorizontal,
                 self.sidebar_page == SidebarPage::Adjustments,
                 Message::SelectSidebarPage(SidebarPage::Adjustments),
@@ -2033,6 +2704,7 @@ impl App {
             });
 
         let page_content: Element<'_, Message> = match self.sidebar_page {
+            SidebarPage::Crop => self.view_crop_page(),
             SidebarPage::Adjustments => self.view_adjustments_page(),
             SidebarPage::Export => self.view_export_page(),
         };
@@ -2061,6 +2733,193 @@ impl App {
         )
         .height(Length::Fill)
         .style(panel_style)
+        .into()
+    }
+
+    fn view_crop_page(&self) -> Element<'_, Message> {
+        let ratio = self.basic_adjustments.aspect_ratio;
+        let active_original = self.active_original_crop_ratio();
+        let is_original_active =
+            matches!((ratio, active_original), (Some(current), Some(original)) if (current - original).abs() < CROP_RATIO_TOLERANCE);
+        let invert_icon = if self.basic_adjustments.aspect_ratio.unwrap_or(1.0) >= 1.0 {
+            AppIcon::RectangleVertical
+        } else {
+            AppIcon::RectangleHorizontal
+        };
+
+        let controls = column![
+            card_section(
+                "Crop & Transform",
+                column![
+                    row![
+                        text("Aspect Ratio")
+                            .size(14)
+                            .color(Color::from_rgb8(0xe7, 0xec, 0xf6)),
+                        Space::with_width(Length::Fill),
+                        top_bar_icon_button(
+                            invert_icon,
+                            self.basic_adjustments
+                                .aspect_ratio
+                                .map(|_| Message::InvertCropAspectRatio),
+                            "Invert aspect ratio",
+                        ),
+                        icon_button(
+                            AppIcon::RotateCcw,
+                            Message::ResetCropTransform,
+                            "Reset crop & transform",
+                        ),
+                    ]
+                    .align_y(iced::alignment::Vertical::Center),
+                    row![
+                        crop_choice_button(
+                            "Free",
+                            ratio.is_none(),
+                            Message::CropPresetSelected(CropPresetKind::Free),
+                        ),
+                        crop_choice_button(
+                            "Original",
+                            is_original_active,
+                            Message::CropPresetSelected(CropPresetKind::Original),
+                        ),
+                        crop_choice_button(
+                            "1:1",
+                            ratio_matches(ratio, 1.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(1.0)),
+                        ),
+                    ]
+                    .spacing(8),
+                    row![
+                        crop_choice_button(
+                            "5:4",
+                            ratio_matches(ratio, 5.0 / 4.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(5.0 / 4.0)),
+                        ),
+                        crop_choice_button(
+                            "4:3",
+                            ratio_matches(ratio, 4.0 / 3.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(4.0 / 3.0)),
+                        ),
+                        crop_choice_button(
+                            "3:2",
+                            ratio_matches(ratio, 3.0 / 2.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(3.0 / 2.0)),
+                        ),
+                    ]
+                    .spacing(8),
+                    row![
+                        crop_choice_button(
+                            "16:9",
+                            ratio_matches(ratio, 16.0 / 9.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(16.0 / 9.0)),
+                        ),
+                        crop_choice_button(
+                            "21:9",
+                            ratio_matches(ratio, 21.0 / 9.0),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(21.0 / 9.0)),
+                        ),
+                        crop_choice_button(
+                            "Golden",
+                            ratio_matches(ratio, BASE_CROP_RATIO),
+                            Message::CropPresetSelected(CropPresetKind::Ratio(BASE_CROP_RATIO)),
+                        ),
+                    ]
+                    .spacing(8),
+                    row![
+                        text_input("W", &self.crop_custom_width)
+                            .on_input(Message::CropCustomWidthChanged)
+                            .on_submit(Message::ApplyCustomCropRatio)
+                            .padding([10, 12])
+                            .size(14)
+                            .width(Length::Fill),
+                        text("×").size(14).color(Color::from_rgb8(0x8d, 0x98, 0xae)),
+                        text_input("H", &self.crop_custom_height)
+                            .on_input(Message::CropCustomHeightChanged)
+                            .on_submit(Message::ApplyCustomCropRatio)
+                            .padding([10, 12])
+                            .size(14)
+                            .width(Length::Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(iced::alignment::Vertical::Center),
+                ]
+                .spacing(12)
+                .into(),
+            ),
+            card_section("Rotation", self.view_crop_rotation_card()),
+            card_section(
+                "Orientation",
+                row![
+                    orientation_action_button(
+                        AppIcon::RotateCcw,
+                        "Rotate L",
+                        Message::RotateLeft,
+                        false,
+                    ),
+                    orientation_action_button(
+                        AppIcon::RotateCw,
+                        "Rotate R",
+                        Message::RotateRight,
+                        false,
+                    ),
+                    orientation_action_button(
+                        AppIcon::FlipHorizontal,
+                        "Flip H",
+                        Message::ToggleFlipHorizontal,
+                        self.basic_adjustments.flip_horizontal,
+                    ),
+                    orientation_action_button(
+                        AppIcon::FlipVertical,
+                        "Flip V",
+                        Message::ToggleFlipVertical,
+                        self.basic_adjustments.flip_vertical,
+                    ),
+                ]
+                .spacing(8)
+                .into(),
+            ),
+        ]
+        .spacing(16);
+
+        container(controls)
+            .padding([20, 14])
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn view_crop_rotation_card(&self) -> Element<'_, Message> {
+        let angle_text = format!("{:.1}°", self.basic_adjustments.rotation);
+
+        column![
+            row![
+                text(angle_text)
+                    .size(30)
+                    .color(Color::from_rgb8(0xf5, 0xf8, 0xfe)),
+                Space::with_width(Length::Fill),
+                crop_rotation_icon_button(
+                    AppIcon::Ruler,
+                    self.crop_ruler_active,
+                    Message::ToggleCropRuler,
+                    "Straighten with ruler",
+                ),
+                crop_rotation_icon_button(
+                    AppIcon::RotateCcw,
+                    false,
+                    Message::ResetCropRotation,
+                    "Reset rotation",
+                ),
+            ]
+            .spacing(8)
+            .align_y(iced::alignment::Vertical::Center),
+            slider(
+                -45.0..=45.0,
+                self.basic_adjustments.rotation,
+                Message::CropRotationChanged,
+            )
+            .on_release(Message::CommitPreviewRender)
+            .step(0.05)
+            .width(Length::Fill),
+        ]
+        .spacing(18)
         .into()
     }
 
@@ -2849,7 +3708,9 @@ impl App {
     }
 
     fn request_preview_render(&mut self, quality: PreviewQuality) -> Task<Message> {
-        let thumbnail_task = if matches!(quality, PreviewQuality::Full) {
+        let thumbnail_task = if matches!(quality, PreviewQuality::Full)
+            && self.sidebar_page != SidebarPage::Crop
+        {
             self.request_selected_thumbnail_render()
         } else {
             Task::none()
@@ -2892,6 +3753,8 @@ impl App {
             adjustments.lut_size = entry.size;
         }
         let is_raw = sample.is_raw;
+        let source_dimensions = (sample.source_width, sample.source_height);
+        let apply_crop = self.sidebar_page != SidebarPage::Crop;
         self.is_rendering_preview = true;
         self.status_message = None;
 
@@ -2899,8 +3762,14 @@ impl App {
             async move {
                 let base_rgba = base_image.to_rgba8().into_raw();
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let transformed = apply_adjustment_transformations(
+                        base_image.as_ref(),
+                        &adjustments,
+                        source_dimensions,
+                        apply_crop,
+                    );
                     renderer
-                        .render(base_image.as_ref(), &adjustments, is_raw)
+                        .render(&transformed, &adjustments, is_raw)
                         .map(|image| {
                             let rendered_rgba = image.to_rgba8().into_raw();
                             let changed = rendered_rgba != base_rgba;
@@ -2910,7 +3779,10 @@ impl App {
                                     image.height(),
                                     rendered_rgba,
                                 ),
+                                width: image.width(),
+                                height: image.height(),
                                 changed,
+                                updates_thumbnail: apply_crop,
                             }
                         })
                 }))
@@ -2944,6 +3816,7 @@ impl App {
                         sample.interactive_preview_image.clone(),
                         sample.adjustments.clone(),
                         sample.is_raw,
+                        (sample.source_width, sample.source_height),
                     )
                 })
             })
@@ -2956,11 +3829,25 @@ impl App {
         Task::perform(
             async move {
                 let mut results = Vec::with_capacity(jobs.len());
-                for (index, base_image, adjustments, is_raw) in jobs {
-                    let rendered = renderer.render(base_image.as_ref(), &adjustments, is_raw);
+                for (index, base_image, adjustments, is_raw, source_dimensions) in jobs {
+                    let transformed = apply_adjustment_transformations(
+                        base_image.as_ref(),
+                        &adjustments,
+                        source_dimensions,
+                        true,
+                    );
+                    let rendered = renderer.render(&transformed, &adjustments, is_raw);
                     let result = rendered.map(|image| {
+                        let (width, height) = image.dimensions();
                         let thumbnail = resize_for_bound(&image, 320);
-                        make_rounded_thumbnail_handle(&thumbnail, FILMSTRIP_IMAGE_RADIUS_PX)
+                        RenderedThumbnail {
+                            handle: make_rounded_thumbnail_handle(
+                                &thumbnail,
+                                FILMSTRIP_IMAGE_RADIUS_PX,
+                            ),
+                            width,
+                            height,
+                        }
                     });
                     results.push((index, result));
                 }
@@ -3064,7 +3951,14 @@ fn load_lut_folder(path: PathBuf) -> Result<LutBrowserState, String> {
 
 fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
     let is_raw = is_supported_raw(&path);
-    let (interactive_preview_image, full_preview_image, preview, thumbnail) =
+    let (
+        source_width,
+        source_height,
+        interactive_preview_image,
+        full_preview_image,
+        preview,
+        thumbnail,
+    ) =
         load_preview_handles(&path)?;
     let histogram = build_histogram(full_preview_image.as_ref());
     let name = path
@@ -3078,6 +3972,9 @@ fn build_sample_image(path: PathBuf) -> Result<SampleImage, String> {
     Ok(SampleImage {
         name: title_case(&name),
         path,
+        source_width,
+        source_height,
+        thumbnail_dimensions: full_preview_image.dimensions(),
         interactive_preview_image,
         full_preview_image,
         preview,
@@ -3093,6 +3990,8 @@ fn load_preview_handles(
     path: &Path,
 ) -> Result<
     (
+        u32,
+        u32,
         Arc<DynamicImage>,
         Arc<DynamicImage>,
         image::Handle,
@@ -3105,6 +4004,7 @@ fn load_preview_handles(
     } else {
         open_image(path).map_err(|error| error.to_string())?
     };
+    let (source_width, source_height) = image.dimensions();
 
     let full_preview_image = resize_for_bound(&image, 1800);
     let interactive_preview_image = resize_for_bound(&full_preview_image, 1100);
@@ -3115,6 +4015,8 @@ fn load_preview_handles(
     );
 
     Ok((
+        source_width,
+        source_height,
         Arc::new(interactive_preview_image),
         Arc::new(full_preview_image),
         preview,
@@ -3418,6 +4320,24 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
     };
 
     BasicAdjustments {
+        aspect_ratio: value
+            .get("aspectRatio")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+        crop: crop_rect_from_value(value.get("crop").unwrap_or(&Value::Null)),
+        rotation: value.get("rotation").and_then(Value::as_f64).unwrap_or(0.0) as f32,
+        flip_horizontal: value
+            .get("flipHorizontal")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        flip_vertical: value
+            .get("flipVertical")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        orientation_steps: value
+            .get("orientationSteps")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u8,
         exposure: value.get("exposure").and_then(Value::as_f64).unwrap_or(0.0) as f32,
         brightness: value
             .get("brightness")
@@ -3533,6 +4453,12 @@ fn adjustments_from_value(value: &Value) -> BasicAdjustments {
 
 fn adjustments_to_value(adjustments: &BasicAdjustments) -> Value {
     json!({
+        "aspectRatio": adjustments.aspect_ratio,
+        "crop": crop_rect_to_value(adjustments.crop),
+        "rotation": adjustments.rotation,
+        "flipHorizontal": adjustments.flip_horizontal,
+        "flipVertical": adjustments.flip_vertical,
+        "orientationSteps": adjustments.orientation_steps,
         "exposure": adjustments.exposure,
         "brightness": adjustments.brightness,
         "contrast": adjustments.contrast,
@@ -3660,6 +4586,27 @@ fn hue_sat_lum_from_value(value: &Value) -> HueSatLum {
             .get("luminance")
             .and_then(Value::as_f64)
             .unwrap_or(0.0) as f32,
+    }
+}
+
+fn crop_rect_from_value(value: &Value) -> Option<CropRect> {
+    Some(CropRect {
+        x: value.get("x")?.as_f64()? as f32,
+        y: value.get("y")?.as_f64()? as f32,
+        width: value.get("width")?.as_f64()? as f32,
+        height: value.get("height")?.as_f64()? as f32,
+    })
+}
+
+fn crop_rect_to_value(value: Option<CropRect>) -> Value {
+    match value {
+        Some(crop) => json!({
+            "x": crop.x,
+            "y": crop.y,
+            "width": crop.width,
+            "height": crop.height,
+        }),
+        None => Value::Null,
     }
 }
 
@@ -3928,6 +4875,552 @@ fn estimate_export_bytes(sample: &SampleImage, settings: &ExportSettingsUi) -> u
     bytes.round() as u64
 }
 
+fn effective_source_dimensions(
+    width: u32,
+    height: u32,
+    orientation_steps: u8,
+) -> Option<(u32, u32)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    if orientation_steps % 2 == 1 {
+        Some((height, width))
+    } else {
+        Some((width, height))
+    }
+}
+
+fn crop_rect_for_ratio(dimensions: Option<(u32, u32)>, ratio: Option<f32>) -> Option<CropRect> {
+    let (width, height) = dimensions?;
+    let ratio = ratio?;
+    if width == 0 || height == 0 || ratio <= 0.0 {
+        return None;
+    }
+
+    let image_ratio = width as f32 / height as f32;
+    if image_ratio > ratio {
+        let crop_width = height as f32 * ratio;
+        Some(CropRect {
+            x: ((width as f32 - crop_width) * 0.5).round().clamp(0.0, width as f32),
+            y: 0.0,
+            width: crop_width.round().clamp(1.0, width as f32),
+            height: height as f32,
+        })
+    } else {
+        let crop_height = width as f32 / ratio;
+        Some(CropRect {
+            x: 0.0,
+            y: ((height as f32 - crop_height) * 0.5).round().clamp(0.0, height as f32),
+            width: width as f32,
+            height: crop_height.round().clamp(1.0, height as f32),
+        })
+    }
+}
+
+fn full_crop_rect(dimensions: Option<(u32, u32)>) -> Option<CropRect> {
+    let (width, height) = dimensions?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    Some(CropRect {
+        x: 0.0,
+        y: 0.0,
+        width: width as f32,
+        height: height as f32,
+    })
+}
+
+fn parse_custom_crop_ratio(width: &str, height: &str) -> Option<f32> {
+    let width = width.trim().parse::<f32>().ok()?;
+    let height = height.trim().parse::<f32>().ok()?;
+    if width > 0.0 && height > 0.0 {
+        Some(width / height)
+    } else {
+        None
+    }
+}
+
+fn trim_ratio_value(value: f32) -> String {
+    let rounded = (value * 10.0).round() / 10.0;
+    if (rounded.fract()).abs() < 0.001 {
+        format!("{}", rounded.round() as i32)
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+fn ratio_matches(current: Option<f32>, target: f32) -> bool {
+    matches!(current, Some(value) if (value - target).abs() < CROP_RATIO_TOLERANCE)
+        || matches!(current, Some(value) if (value - (1.0 / target)).abs() < CROP_RATIO_TOLERANCE)
+}
+
+fn scale_crop_rect(crop: CropRect, source_dimensions: (u32, u32), image_dimensions: (u32, u32)) -> CropRect {
+    let scale_x = image_dimensions.0 as f32 / source_dimensions.0.max(1) as f32;
+    let scale_y = image_dimensions.1 as f32 / source_dimensions.1.max(1) as f32;
+
+    CropRect {
+        x: crop.x * scale_x,
+        y: crop.y * scale_y,
+        width: crop.width * scale_x,
+        height: crop.height * scale_y,
+    }
+}
+
+fn fitted_rect(bounds: Size, image_size: (u32, u32)) -> Rectangle {
+    let image_width = image_size.0.max(1) as f32;
+    let image_height = image_size.1.max(1) as f32;
+    let scale = (bounds.width / image_width).min(bounds.height / image_height);
+    let width = image_width * scale;
+    let height = image_height * scale;
+    Rectangle {
+        x: (bounds.width - width) * 0.5,
+        y: (bounds.height - height) * 0.5,
+        width,
+        height,
+    }
+}
+
+fn crop_overlay_rect_in_bounds(crop: CropRect, image_size: (u32, u32), bounds: Size) -> Rectangle {
+    let image_rect = fitted_rect(bounds, image_size);
+    let scale_x = image_rect.width / image_size.0.max(1) as f32;
+    let scale_y = image_rect.height / image_size.1.max(1) as f32;
+    Rectangle {
+        x: image_rect.x + crop.x * scale_x,
+        y: image_rect.y + crop.y * scale_y,
+        width: crop.width * scale_x,
+        height: crop.height * scale_y,
+    }
+}
+
+fn crop_rect_from_overlay_rect(rect: Rectangle, image_size: (u32, u32), bounds: Size) -> CropRect {
+    let image_rect = fitted_rect(bounds, image_size);
+    let scale_x = image_size.0.max(1) as f32 / image_rect.width.max(1.0);
+    let scale_y = image_size.1.max(1) as f32 / image_rect.height.max(1.0);
+
+    let min_x = rect.x.max(image_rect.x);
+    let min_y = rect.y.max(image_rect.y);
+    let max_x = (rect.x + rect.width).min(image_rect.x + image_rect.width);
+    let max_y = (rect.y + rect.height).min(image_rect.y + image_rect.height);
+    let overlay_width = (max_x - min_x).max(0.0);
+    let overlay_height = (max_y - min_y).max(0.0);
+
+    CropRect {
+        x: safe_clamp((min_x - image_rect.x) * scale_x, 0.0, image_size.0 as f32),
+        y: safe_clamp((min_y - image_rect.y) * scale_y, 0.0, image_size.1 as f32),
+        width: safe_clamp(overlay_width * scale_x, 1.0, image_size.0 as f32),
+        height: safe_clamp(overlay_height * scale_y, 1.0, image_size.1 as f32),
+    }
+}
+
+fn point_in_rect(point: Point, rect: Rectangle) -> bool {
+    point.x >= rect.x
+        && point.x <= rect.x + rect.width
+        && point.y >= rect.y
+        && point.y <= rect.y + rect.height
+}
+
+fn clamp_point_to_rect(point: Point, rect: Rectangle) -> Point {
+    Point::new(
+        safe_clamp(point.x, rect.x, rect.x + rect.width),
+        safe_clamp(point.y, rect.y, rect.y + rect.height),
+    )
+}
+
+fn ruler_rotation_from_line(start: Point, end: Point) -> Option<f32> {
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    if (dx * dx + dy * dy).sqrt() < 8.0 {
+        return None;
+    }
+
+    let angle_degrees = dy.atan2(dx).to_degrees();
+    Some((-angle_degrees).clamp(-45.0, 45.0))
+}
+
+fn move_crop_overlay_rect(rect: Rectangle, image_rect: Rectangle, delta: Point) -> Rectangle {
+    let mut x = rect.x + delta.x;
+    let mut y = rect.y + delta.y;
+    x = safe_clamp(x, image_rect.x, image_rect.x + image_rect.width - rect.width);
+    y = safe_clamp(y, image_rect.y, image_rect.y + image_rect.height - rect.height);
+    Rectangle { x, y, ..rect }
+}
+
+fn resize_crop_overlay_rect(
+    rect: Rectangle,
+    image_rect: Rectangle,
+    handle: usize,
+    delta: Point,
+    locked_ratio: Option<f32>,
+) -> Rectangle {
+    if let Some(ratio) = locked_ratio.filter(|ratio| *ratio > 0.0) {
+        return resize_crop_overlay_rect_locked(rect, image_rect, handle, delta, ratio);
+    }
+
+    let min_size = 40.0_f32
+        .min(image_rect.width.max(1.0))
+        .min(image_rect.height.max(1.0));
+    let mut left = rect.x;
+    let mut top = rect.y;
+    let mut right = rect.x + rect.width;
+    let mut bottom = rect.y + rect.height;
+
+    match handle {
+        0 => {
+            left += delta.x;
+            top += delta.y;
+        }
+        1 => {
+            top += delta.y;
+        }
+        2 => {
+            right += delta.x;
+            top += delta.y;
+        }
+        3 => {
+            left += delta.x;
+        }
+        4 => {
+            right += delta.x;
+        }
+        5 => {
+            left += delta.x;
+            bottom += delta.y;
+        }
+        6 => {
+            bottom += delta.y;
+        }
+        7 => {
+            right += delta.x;
+            bottom += delta.y;
+        }
+        _ => {}
+    }
+
+    let max_left = (right - min_size).max(image_rect.x);
+    let max_top = (bottom - min_size).max(image_rect.y);
+    left = safe_clamp(left, image_rect.x, max_left);
+    top = safe_clamp(top, image_rect.y, max_top);
+
+    let min_right = (left + min_size).min(image_rect.x + image_rect.width);
+    let min_bottom = (top + min_size).min(image_rect.y + image_rect.height);
+    right = safe_clamp(right, min_right, image_rect.x + image_rect.width);
+    bottom = safe_clamp(bottom, min_bottom, image_rect.y + image_rect.height);
+
+    Rectangle {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    }
+}
+
+fn resize_crop_overlay_rect_locked(
+    rect: Rectangle,
+    image_rect: Rectangle,
+    handle: usize,
+    delta: Point,
+    ratio: f32,
+) -> Rectangle {
+    let ratio = ratio.max(0.001);
+    let min_width = 40.0_f32.max(40.0 * ratio).min(image_rect.width.max(1.0));
+    let min_height = 40.0_f32.max(40.0 / ratio).min(image_rect.height.max(1.0));
+
+    let left = rect.x;
+    let top = rect.y;
+    let right = rect.x + rect.width;
+    let bottom = rect.y + rect.height;
+    let center_x = left + rect.width * 0.5;
+    let center_y = top + rect.height * 0.5;
+
+    match handle {
+        0 | 2 | 5 | 7 => resize_crop_overlay_rect_locked_corner(
+            image_rect,
+            handle,
+            Point::new(left, top),
+            Point::new(right, bottom),
+            delta,
+            ratio,
+            min_width,
+            min_height,
+        ),
+        1 => {
+            let proposed_top = top + delta.y;
+            let max_half_width = (center_x - image_rect.x)
+                .min(image_rect.x + image_rect.width - center_x)
+                .max(0.0);
+            let max_width = (max_half_width * 2.0).max(1.0);
+            let max_height = (bottom - image_rect.y).min(max_width / ratio);
+            let height = safe_clamp(bottom - proposed_top, min_height, max_height);
+            let width = safe_clamp(height * ratio, min_width, max_width);
+            clamp_rect_to_image(
+                Rectangle {
+                x: center_x - width * 0.5,
+                y: bottom - height,
+                width,
+                height,
+            },
+                image_rect,
+            )
+        }
+        6 => {
+            let proposed_bottom = bottom + delta.y;
+            let max_half_width = (center_x - image_rect.x)
+                .min(image_rect.x + image_rect.width - center_x)
+                .max(0.0);
+            let max_width = (max_half_width * 2.0).max(1.0);
+            let max_height = (image_rect.y + image_rect.height - top).min(max_width / ratio);
+            let height = safe_clamp(proposed_bottom - top, min_height, max_height);
+            let width = safe_clamp(height * ratio, min_width, max_width);
+            clamp_rect_to_image(
+                Rectangle {
+                x: center_x - width * 0.5,
+                y: top,
+                width,
+                height,
+            },
+                image_rect,
+            )
+        }
+        3 => {
+            let proposed_left = left + delta.x;
+            let max_half_height = (center_y - image_rect.y)
+                .min(image_rect.y + image_rect.height - center_y)
+                .max(0.0);
+            let max_height = (max_half_height * 2.0).max(1.0);
+            let max_width = (right - image_rect.x).min(max_height * ratio);
+            let width = safe_clamp(right - proposed_left, min_width, max_width);
+            let height = safe_clamp(width / ratio, min_height, max_height);
+            clamp_rect_to_image(
+                Rectangle {
+                x: right - width,
+                y: center_y - height * 0.5,
+                width,
+                height,
+            },
+                image_rect,
+            )
+        }
+        4 => {
+            let proposed_right = right + delta.x;
+            let max_half_height = (center_y - image_rect.y)
+                .min(image_rect.y + image_rect.height - center_y)
+                .max(0.0);
+            let max_height = (max_half_height * 2.0).max(1.0);
+            let max_width = (image_rect.x + image_rect.width - left).min(max_height * ratio);
+            let width = safe_clamp(proposed_right - left, min_width, max_width);
+            let height = safe_clamp(width / ratio, min_height, max_height);
+            clamp_rect_to_image(
+                Rectangle {
+                x: left,
+                y: center_y - height * 0.5,
+                width,
+                height,
+            },
+                image_rect,
+            )
+        }
+        _ => rect,
+    }
+}
+
+fn resize_crop_overlay_rect_locked_corner(
+    image_rect: Rectangle,
+    handle: usize,
+    top_left: Point,
+    bottom_right: Point,
+    delta: Point,
+    ratio: f32,
+    min_width: f32,
+    min_height: f32,
+) -> Rectangle {
+    let (anchor_x, anchor_y, proposed_x, proposed_y, anchor_is_left, anchor_is_top) = match handle {
+        0 => (
+            bottom_right.x,
+            bottom_right.y,
+            top_left.x + delta.x,
+            top_left.y + delta.y,
+            false,
+            false,
+        ),
+        2 => (
+            top_left.x,
+            bottom_right.y,
+            bottom_right.x + delta.x,
+            top_left.y + delta.y,
+            true,
+            false,
+        ),
+        5 => (
+            bottom_right.x,
+            top_left.y,
+            top_left.x + delta.x,
+            bottom_right.y + delta.y,
+            false,
+            true,
+        ),
+        7 => (
+            top_left.x,
+            top_left.y,
+            bottom_right.x + delta.x,
+            bottom_right.y + delta.y,
+            true,
+            true,
+        ),
+        _ => {
+            return Rectangle {
+                x: top_left.x,
+                y: top_left.y,
+                width: bottom_right.x - top_left.x,
+                height: bottom_right.y - top_left.y,
+            };
+        }
+    };
+
+    let desired_width = if anchor_is_left {
+        proposed_x - anchor_x
+    } else {
+        anchor_x - proposed_x
+    };
+    let desired_height = if anchor_is_top {
+        proposed_y - anchor_y
+    } else {
+        anchor_y - proposed_y
+    };
+
+    let max_width = if anchor_is_left {
+        (image_rect.x + image_rect.width - anchor_x).max(1.0)
+    } else {
+        (anchor_x - image_rect.x).max(1.0)
+    };
+    let max_height = if anchor_is_top {
+        (image_rect.y + image_rect.height - anchor_y).max(1.0)
+    } else {
+        (anchor_y - image_rect.y).max(1.0)
+    };
+    let width_limit = max_width.min(max_height * ratio);
+    let height_limit = max_height.min(max_width / ratio);
+
+    // Project the cursor onto the aspect-locked diagonal so the dragged corner
+    // stays visually attached to the mouse instead of drifting away.
+    let projected_height =
+        ((desired_width * ratio) + desired_height) / (ratio * ratio + 1.0);
+    let height = safe_clamp(projected_height, min_height, height_limit);
+    let width = safe_clamp(height * ratio, min_width, width_limit);
+    let height = safe_clamp(width / ratio, min_height, height_limit);
+
+    let left = if anchor_is_left { anchor_x } else { anchor_x - width };
+    let top = if anchor_is_top { anchor_y } else { anchor_y - height };
+
+    clamp_rect_to_image(
+        Rectangle {
+        x: left,
+        y: top,
+        width,
+        height,
+    },
+        image_rect,
+    )
+}
+
+fn safe_clamp(value: f32, min: f32, max: f32) -> f32 {
+    if !value.is_finite() {
+        return min.max(0.0);
+    }
+
+    let lower = min.min(max);
+    let upper = min.max(max);
+    value.clamp(lower, upper)
+}
+
+fn clamp_rect_to_image(rect: Rectangle, image_rect: Rectangle) -> Rectangle {
+    let width = rect.width.min(image_rect.width).max(1.0);
+    let height = rect.height.min(image_rect.height).max(1.0);
+    let x = safe_clamp(rect.x, image_rect.x, image_rect.x + image_rect.width - width);
+    let y = safe_clamp(rect.y, image_rect.y, image_rect.y + image_rect.height - height);
+
+    Rectangle {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn crop_handle_rects(crop_rect: Rectangle) -> [Rectangle; 8] {
+    let size = 10.0;
+    let half = size * 0.5;
+    let mid_x = crop_rect.x + crop_rect.width * 0.5;
+    let mid_y = crop_rect.y + crop_rect.height * 0.5;
+
+    [
+        Rectangle { x: crop_rect.x, y: crop_rect.y, width: size, height: size },
+        Rectangle { x: mid_x - half, y: crop_rect.y, width: size, height: size },
+        Rectangle { x: crop_rect.x + crop_rect.width - size, y: crop_rect.y, width: size, height: size },
+        Rectangle { x: crop_rect.x, y: mid_y - half, width: size, height: size },
+        Rectangle { x: crop_rect.x + crop_rect.width - size, y: mid_y - half, width: size, height: size },
+        Rectangle { x: crop_rect.x, y: crop_rect.y + crop_rect.height - size, width: size, height: size },
+        Rectangle { x: mid_x - half, y: crop_rect.y + crop_rect.height - size, width: size, height: size },
+        Rectangle { x: crop_rect.x + crop_rect.width - size, y: crop_rect.y + crop_rect.height - size, width: size, height: size },
+    ]
+}
+
+fn apply_adjustment_transformations(
+    image: &DynamicImage,
+    adjustments: &BasicAdjustments,
+    source_dimensions: (u32, u32),
+    apply_crop: bool,
+) -> DynamicImage {
+    let mut transformed = match adjustments.orientation_steps % 4 {
+        1 => image.rotate90(),
+        2 => image.rotate180(),
+        3 => image.rotate270(),
+        _ => image.clone(),
+    };
+
+    if adjustments.flip_horizontal {
+        transformed = transformed.fliph();
+    }
+    if adjustments.flip_vertical {
+        transformed = transformed.flipv();
+    }
+
+    if adjustments.rotation.abs() > 0.01 {
+        let rgba = transformed.to_rgba32f();
+        let rotated = rotate_about_center(
+            &rgba,
+            adjustments.rotation.to_radians(),
+            Interpolation::Bilinear,
+            Rgba([0.0, 0.0, 0.0, 0.0]),
+        );
+        transformed = DynamicImage::ImageRgba32F(rotated);
+    }
+
+    if apply_crop {
+        if let Some(crop) = adjustments.crop {
+        if let Some(oriented_source_dimensions) = effective_source_dimensions(
+            source_dimensions.0,
+            source_dimensions.1,
+            adjustments.orientation_steps,
+        ) {
+            let scaled = scale_crop_rect(crop, oriented_source_dimensions, transformed.dimensions());
+            let x = scaled.x.round().max(0.0) as u32;
+            let y = scaled.y.round().max(0.0) as u32;
+            let width = scaled.width.round().max(1.0) as u32;
+            let height = scaled.height.round().max(1.0) as u32;
+            let max_width = transformed.width().saturating_sub(x);
+            let max_height = transformed.height().saturating_sub(y);
+            if max_width > 0 && max_height > 0 {
+                transformed = transformed.crop_imm(x, y, width.min(max_width), height.min(max_height));
+            }
+        }
+    }
+    }
+
+    transformed
+}
+
 async fn export_images_task(
     output_folder: PathBuf,
     jobs: Vec<ExportJob>,
@@ -3957,7 +5450,14 @@ fn export_images(
 
     for job in jobs {
         let source_image = load_full_resolution_image(&job.path, job.is_raw)?;
-        let rendered = renderer.render(&source_image, &job.adjustments, job.is_raw)?;
+        let source_dimensions = source_image.dimensions();
+        let transformed = apply_adjustment_transformations(
+            &source_image,
+            &job.adjustments,
+            source_dimensions,
+            true,
+        );
+        let rendered = renderer.render(&transformed, &job.adjustments, job.is_raw)?;
         let resized = apply_export_resize(&rendered, settings);
         let final_image = apply_export_watermark(resized, settings)?;
         let output_path = make_export_output_path(output_folder, &job.path, settings.file_format);
@@ -4319,6 +5819,85 @@ fn export_choice_button<'a>(label: &'a str, active: bool, message: Message) -> E
     .into()
 }
 
+fn crop_choice_button<'a>(label: &'a str, active: bool, message: Message) -> Element<'a, Message> {
+    button(
+        text(label)
+            .size(13)
+            .color(if active {
+                Color::WHITE
+            } else {
+                Color::from_rgb8(0xc2, 0xcb, 0xdd)
+            }),
+    )
+    .padding([8, 10])
+    .width(Length::Fill)
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(if active {
+            Color::from_rgb8(0x24, 0x5d, 0x88)
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => Color::from_rgb8(0x2a, 0x33, 0x42),
+                _ => Color::from_rgb8(0x24, 0x2d, 0x3a),
+            }
+        }));
+        style.border.radius = 10.0.into();
+        style.text_color = Color::WHITE;
+        style
+    })
+    .on_press(message)
+    .into()
+}
+
+fn orientation_action_button<'a>(
+    icon: AppIcon,
+    label: &'a str,
+    message: Message,
+    active: bool,
+) -> Element<'a, Message> {
+    button(
+        container(
+            column![
+                app_icon(icon, 18.0, Color::WHITE),
+                text(label)
+                    .size(11)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+                    .color(if active {
+                        Color::WHITE
+                    } else {
+                        Color::from_rgb8(0xc2, 0xcb, 0xdd)
+                    }),
+            ]
+            .spacing(6)
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center),
+        )
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Shrink),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(92.0))
+    .padding([10, 8])
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        style.background = Some(Background::Color(if active {
+            Color::from_rgb8(0x24, 0x5d, 0x88)
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => Color::from_rgb8(0x2a, 0x33, 0x42),
+                _ => Color::from_rgb8(0x24, 0x2d, 0x3a),
+            }
+        }));
+        style.border.radius = 12.0.into();
+        style.text_color = Color::WHITE;
+        style
+    })
+    .on_press(message)
+    .into()
+}
+
 fn export_toggle_row<'a>(
     label: &'a str,
     _enabled: bool,
@@ -4527,10 +6106,17 @@ fn lucide_icon(icon: AppIcon) -> LucideIcon {
         AppIcon::Check => LucideIcon::Check,
         AppIcon::ChevronDown => LucideIcon::ChevronDown,
         AppIcon::ChevronUp => LucideIcon::ChevronUp,
+        AppIcon::Crop => LucideIcon::Scaling,
         AppIcon::SlidersHorizontal => LucideIcon::SlidersHorizontal,
         AppIcon::Share => LucideIcon::Share,
         AppIcon::FolderOpen => LucideIcon::FolderOpen,
         AppIcon::RotateCcw => LucideIcon::Undo2,
+        AppIcon::RotateCw => LucideIcon::RotateCw,
+        AppIcon::Ruler => LucideIcon::Ruler,
+        AppIcon::FlipHorizontal => LucideIcon::FlipHorizontal2,
+        AppIcon::FlipVertical => LucideIcon::FlipVertical2,
+        AppIcon::RectangleHorizontal => LucideIcon::RectangleHorizontal,
+        AppIcon::RectangleVertical => LucideIcon::RectangleVertical,
         AppIcon::Star => LucideIcon::Star,
         AppIcon::X => LucideIcon::X,
     }
@@ -4611,6 +6197,64 @@ fn icon_button<'a>(icon: AppIcon, message: Message, _title: &'a str) -> Element<
         style
     })
     .on_press(message)
+    .into()
+}
+
+fn crop_rotation_icon_button<'a>(
+    icon: AppIcon,
+    active: bool,
+    message: Message,
+    tip: &'a str,
+) -> Element<'a, Message> {
+    let button = button(
+        container(app_icon(
+            icon,
+            18.0,
+            if active {
+                Color::WHITE
+            } else {
+                Color::from_rgb8(0xb1, 0xba, 0xce)
+            },
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(iced::alignment::Vertical::Center),
+    )
+    .width(Length::Fixed(34.0))
+    .height(Length::Fixed(34.0))
+    .padding(0)
+    .style(move |theme, status| {
+        let mut style = iced::widget::button::secondary(theme, status);
+        let background = if active {
+            Color::from_rgb8(0x24, 0x5d, 0x88)
+        } else {
+            match status {
+                iced::widget::button::Status::Hovered => Color::from_rgb8(0x22, 0x28, 0x34),
+                iced::widget::button::Status::Pressed => Color::from_rgb8(0x26, 0x2d, 0x39),
+                _ => Color::from_rgb8(0x1b, 0x21, 0x2c),
+            }
+        };
+        style.background = Some(Background::Color(background));
+        style.border.radius = 999.0.into();
+        style.text_color = Color::WHITE;
+        style
+    })
+    .on_press(message);
+
+    tooltip(
+        button,
+        container(text(tip).size(12).color(Color::from_rgb8(0xe2, 0xe8, 0xf0)))
+            .padding([6, 10])
+            .style(|_| container::Style {
+                text_color: Some(Color::WHITE),
+                background: Some(Background::Color(Color::from_rgb8(0x0f, 0x14, 0x1d))),
+                border: Border::default().rounded(10.0),
+                ..container::Style::default()
+            }),
+        tooltip::Position::Bottom,
+    )
+    .gap(8)
     .into()
 }
 
