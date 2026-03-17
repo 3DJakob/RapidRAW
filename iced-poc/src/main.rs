@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-const BASE_CROP_RATIO: f32 = 1.618;
 const CROP_RATIO_TOLERANCE: f32 = 0.01;
 
 fn main() -> iced::Result {
@@ -1143,18 +1142,14 @@ impl App {
             }
             Message::CropRotationChanged(value) => {
                 self.basic_adjustments.rotation = value;
-                self.update_selected_adjustments(UndoBehavior::Coalesced, |adjustments| {
-                    adjustments.rotation = value;
-                });
+                self.update_selected_rotation(value, UndoBehavior::Coalesced);
                 return self.request_preview_render(PreviewQuality::Interactive);
             }
             Message::ApplyRulerRotation(value) => {
                 let value = (self.basic_adjustments.rotation + value).clamp(-45.0, 45.0);
                 self.crop_ruler_active = false;
                 self.basic_adjustments.rotation = value;
-                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
-                    adjustments.rotation = value;
-                });
+                self.update_selected_rotation(value, UndoBehavior::Immediate);
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::ToggleCropRuler => {
@@ -1163,9 +1158,7 @@ impl App {
             Message::ResetCropRotation => {
                 self.crop_ruler_active = false;
                 self.basic_adjustments.rotation = 0.0;
-                self.update_selected_adjustments(UndoBehavior::Immediate, |adjustments| {
-                    adjustments.rotation = 0.0;
-                });
+                self.update_selected_rotation(0.0, UndoBehavior::Immediate);
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::CropOverlayChanged(crop) => {
@@ -2146,6 +2139,67 @@ impl App {
         }
     }
 
+    fn update_selected_rotation(&mut self, rotation: f32, undo_behavior: UndoBehavior) {
+        if matches!(undo_behavior, UndoBehavior::Immediate) {
+            self.finish_pending_drag_undo();
+        }
+
+        let selected: Vec<usize> = if self.selected_indices.is_empty() {
+            vec![self.selected_index]
+        } else {
+            self.selected_indices.iter().copied().collect()
+        };
+
+        let mut undo_changes = Vec::new();
+
+        for index in selected {
+            if let Some(sample) = self.samples.get_mut(index) {
+                let previous = sample.adjustments.clone();
+                sample.adjustments.rotation = rotation;
+                let dims = effective_source_dimensions(
+                    sample.source_width,
+                    sample.source_height,
+                    sample.adjustments.orientation_steps,
+                );
+                sample.adjustments.crop = crop_rect_for_rotation(
+                    dims,
+                    sample.adjustments.rotation,
+                    sample.adjustments.aspect_ratio,
+                );
+
+                if sample.adjustments != previous {
+                    undo_changes.push(UndoChange {
+                        index,
+                        adjustments: previous,
+                    });
+                }
+                if let Err(error) = save_sample_adjustments(sample) {
+                    self.status_message = Some(error);
+                }
+            }
+        }
+
+        if !undo_changes.is_empty() {
+            match undo_behavior {
+                UndoBehavior::Immediate => self.push_undo_entry(UndoEntry {
+                    changes: undo_changes,
+                }),
+                UndoBehavior::Coalesced => {
+                    if self.pending_drag_undo.is_none() {
+                        self.pending_drag_undo = Some(UndoEntry {
+                            changes: undo_changes,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(sample) = self.samples.get(self.selected_index) {
+            self.basic_adjustments = sample.adjustments.clone();
+            self.sync_crop_custom_inputs();
+        }
+    }
+
     fn sync_crop_custom_inputs(&mut self) {
         if let Some(ratio) = self.basic_adjustments.aspect_ratio {
             let height = 100.0;
@@ -2739,6 +2793,7 @@ impl App {
     fn view_crop_page(&self) -> Element<'_, Message> {
         let ratio = self.basic_adjustments.aspect_ratio;
         let active_original = self.active_original_crop_ratio();
+        let custom_ratio = parse_custom_crop_ratio(&self.crop_custom_width, &self.crop_custom_height);
         let is_original_active =
             matches!((ratio, active_original), (Some(current), Some(original)) if (current - original).abs() < CROP_RATIO_TOLERANCE);
         let invert_icon = if self.basic_adjustments.aspect_ratio.unwrap_or(1.0) >= 1.0 {
@@ -2818,9 +2873,9 @@ impl App {
                             Message::CropPresetSelected(CropPresetKind::Ratio(21.0 / 9.0)),
                         ),
                         crop_choice_button(
-                            "Golden",
-                            ratio_matches(ratio, BASE_CROP_RATIO),
-                            Message::CropPresetSelected(CropPresetKind::Ratio(BASE_CROP_RATIO)),
+                            "Custom",
+                            matches!((ratio, custom_ratio), (Some(current), Some(custom)) if (current - custom).abs() < CROP_RATIO_TOLERANCE),
+                            Message::ApplyCustomCropRatio,
                         ),
                     ]
                     .spacing(8),
@@ -2830,6 +2885,7 @@ impl App {
                             .on_submit(Message::ApplyCustomCropRatio)
                             .padding([10, 12])
                             .size(14)
+                            .style(filled_text_input_style)
                             .width(Length::Fill),
                         text("×").size(14).color(Color::from_rgb8(0x8d, 0x98, 0xae)),
                         text_input("H", &self.crop_custom_height)
@@ -2837,6 +2893,7 @@ impl App {
                             .on_submit(Message::ApplyCustomCropRatio)
                             .padding([10, 12])
                             .size(14)
+                            .style(filled_text_input_style)
                             .width(Length::Fill),
                     ]
                     .spacing(8)
@@ -4918,6 +4975,84 @@ fn crop_rect_for_ratio(dimensions: Option<(u32, u32)>, ratio: Option<f32>) -> Op
     }
 }
 
+fn crop_rect_for_rotation(
+    dimensions: Option<(u32, u32)>,
+    rotation_degrees: f32,
+    ratio: Option<f32>,
+) -> Option<CropRect> {
+    let (width, height) = dimensions?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let width_f = width as f32;
+    let height_f = height as f32;
+    let (safe_width, safe_height) = largest_rotated_rect(width_f, height_f, rotation_degrees)?;
+
+    let (crop_width, crop_height) = if let Some(target_ratio) = ratio.filter(|ratio| *ratio > 0.0)
+    {
+        fit_ratio_inside(safe_width, safe_height, target_ratio)
+    } else {
+        (safe_width, safe_height)
+    };
+
+    Some(CropRect {
+        x: ((width_f - crop_width) * 0.5).max(0.0),
+        y: ((height_f - crop_height) * 0.5).max(0.0),
+        width: crop_width.clamp(1.0, width_f),
+        height: crop_height.clamp(1.0, height_f),
+    })
+}
+
+fn largest_rotated_rect(width: f32, height: f32, angle_degrees: f32) -> Option<(f32, f32)> {
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+
+    let angle = angle_degrees.abs().to_radians().rem_euclid(std::f32::consts::FRAC_PI_2);
+    if angle.abs() < 0.0001 {
+        return Some((width, height));
+    }
+
+    let width_is_longer = width >= height;
+    let (side_long, side_short) = if width_is_longer {
+        (width, height)
+    } else {
+        (height, width)
+    };
+
+    let sin_a = angle.sin().abs();
+    let cos_a = angle.cos().abs();
+
+    let (wr, hr) = if side_short <= 2.0 * sin_a * cos_a * side_long
+        || (sin_a - cos_a).abs() < 0.0001
+    {
+        let x = 0.5 * side_short;
+        if width_is_longer {
+            (x / sin_a.max(0.0001), x / cos_a.max(0.0001))
+        } else {
+            (x / cos_a.max(0.0001), x / sin_a.max(0.0001))
+        }
+    } else {
+        let cos_2a = (cos_a * cos_a - sin_a * sin_a).abs().max(0.0001);
+        (
+            (width * cos_a - height * sin_a) / cos_2a,
+            (height * cos_a - width * sin_a) / cos_2a,
+        )
+    };
+
+    Some((wr.max(1.0).min(width), hr.max(1.0).min(height)))
+}
+
+fn fit_ratio_inside(width: f32, height: f32, ratio: f32) -> (f32, f32) {
+    let ratio = ratio.max(0.0001);
+    if width / height > ratio {
+        (height * ratio, height)
+    } else {
+        (width, width / ratio)
+    }
+}
+
 fn full_crop_rect(dimensions: Option<(u32, u32)>) -> Option<CropRect> {
     let (width, height) = dimensions?;
     if width == 0 || height == 0 {
@@ -5847,6 +5982,22 @@ fn crop_choice_button<'a>(label: &'a str, active: bool, message: Message) -> Ele
     })
     .on_press(message)
     .into()
+}
+
+fn filled_text_input_style(
+    theme: &Theme,
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    let mut style = iced::widget::text_input::default(theme, status);
+    style.background = Background::Color(Color::from_rgb8(0x21, 0x28, 0x35));
+    style.border.radius = 12.0.into();
+    style.border.width = 0.0;
+    style.border.color = Color::TRANSPARENT;
+    style.icon = Color::from_rgb8(0xa8, 0xb2, 0xc8);
+    style.placeholder = Color::from_rgb8(0x7f, 0x89, 0x9d);
+    style.value = Color::from_rgb8(0xe7, 0xec, 0xf6);
+    style.selection = Color::from_rgba8(0x24, 0x5d, 0x88, 0.45);
+    style
 }
 
 fn orientation_action_button<'a>(
