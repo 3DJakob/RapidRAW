@@ -2017,6 +2017,7 @@ impl App {
                             if rendered.updates_thumbnail
                                 && let Some(sample) = self.samples.get_mut(self.selected_index)
                             {
+                                sample.preview = rendered.handle.clone();
                                 if let image::Handle::Rgba {
                                     width,
                                     height,
