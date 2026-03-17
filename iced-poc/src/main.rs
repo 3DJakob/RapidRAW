@@ -1,8 +1,8 @@
 mod rapidraw_shader;
 
 use ::image::{
-    DynamicImage, GenericImageView, RgbImage, Rgba, RgbaImage, imageops::FilterType,
-    open as open_image,
+    DynamicImage, GenericImageView, ImageBuffer, Rgb, Rgba, RgbaImage,
+    imageops::FilterType, open as open_image,
 };
 use imageproc::geometric_transformations::{Interpolation, rotate_about_center};
 use iced::widget::{
@@ -22,6 +22,7 @@ use rapidraw_shader::{
 use rawler::{
     decoders::{Orientation, RawDecodeParams},
     imgop::develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
+    rawimage::{RawImage, RawPhotometricInterpretation},
     rawsource::RawSource,
 };
 use serde::{Deserialize, Serialize};
@@ -4049,7 +4050,7 @@ fn load_preview_handles(
     let image = if is_supported_raw(path) {
         decode_raw_preview(path)?
     } else {
-        open_image(path).map_err(|error| error.to_string())?
+        load_standard_image(path)?
     };
     let (source_width, source_height) = image.dimensions();
 
@@ -4126,7 +4127,7 @@ fn decode_raw_preview(path: &Path) -> Result<DynamicImage, String> {
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let source = RawSource::new_from_slice(&bytes);
     let decoder = rawler::get_decoder(&source).map_err(|error| error.to_string())?;
-    let raw_image = decoder
+    let mut raw_image: RawImage = decoder
         .raw_image(&source, &RawDecodeParams::default(), false)
         .map_err(|error| error.to_string())?;
     let metadata = decoder
@@ -4139,17 +4140,117 @@ fn decode_raw_preview(path: &Path) -> Result<DynamicImage, String> {
         .map(Orientation::from_u16)
         .unwrap_or(Orientation::Normal);
 
+    let is_linear_format = matches!(
+        raw_image.photometric,
+        RawPhotometricInterpretation::LinearRaw
+    );
+
+    let original_white_level = raw_image
+        .whitelevel
+        .0
+        .first()
+        .copied()
+        .unwrap_or(u16::MAX as u32) as f32;
+    let original_black_level = raw_image
+        .blacklevel
+        .levels
+        .first()
+        .map(|row| row.as_f32())
+        .unwrap_or(0.0);
+
+    for level in raw_image.whitelevel.0.iter_mut() {
+        *level = u32::MAX;
+    }
+
     let mut developer = RawDevelop::default();
-    developer.demosaic_algorithm = DemosaicAlgorithm::Speed;
+    developer.demosaic_algorithm = DemosaicAlgorithm::Quality;
     developer.steps.retain(|&step| step != ProcessingStep::SRgb);
 
-    let developed = developer
+    let mut developed = developer
         .develop_intermediate(&raw_image)
         .map_err(|error| error.to_string())?;
 
-    let dynamic = intermediate_to_dynamic_image(developed)?;
+    let denominator = (original_white_level - original_black_level).max(1.0);
+    let rescale_factor = (u32::MAX as f32 - original_black_level) / denominator;
+    let safe_highlight_compression = 2.5_f32.max(1.01);
 
-    Ok(apply_orientation(dynamic, orientation))
+    match &mut developed {
+        Intermediate::Monochrome(pixels) => {
+            pixels.data.iter_mut().for_each(|pixel| {
+                let mut linear = *pixel * rescale_factor;
+                if is_linear_format {
+                    linear = srgb_to_linear(linear.clamp(0.0, 1.0));
+                }
+                *pixel = linear;
+            });
+        }
+        Intermediate::ThreeColor(pixels) => {
+            pixels.data.iter_mut().for_each(|pixel| {
+                let mut r = (pixel[0] * rescale_factor).max(0.0);
+                let mut g = (pixel[1] * rescale_factor).max(0.0);
+                let mut b = (pixel[2] * rescale_factor).max(0.0);
+
+                if is_linear_format {
+                    r = srgb_to_linear(r.clamp(0.0, 1.0));
+                    g = srgb_to_linear(g.clamp(0.0, 1.0));
+                    b = srgb_to_linear(b.clamp(0.0, 1.0));
+                }
+
+                let max_c = r.max(g).max(b);
+                let (final_r, final_g, final_b) = if max_c > 1.0 {
+                    let min_c = r.min(g).min(b);
+                    let compression_factor =
+                        (1.0 - (max_c - 1.0) / (safe_highlight_compression - 1.0))
+                            .clamp(0.0, 1.0);
+                    let compressed_r = min_c + (r - min_c) * compression_factor;
+                    let compressed_g = min_c + (g - min_c) * compression_factor;
+                    let compressed_b = min_c + (b - min_c) * compression_factor;
+                    let compressed_max = compressed_r.max(compressed_g).max(compressed_b);
+
+                    if compressed_max > 1e-6 {
+                        let rescale = max_c / compressed_max;
+                        (
+                            compressed_r * rescale,
+                            compressed_g * rescale,
+                            compressed_b * rescale,
+                        )
+                    } else {
+                        (max_c, max_c, max_c)
+                    }
+                } else {
+                    (r, g, b)
+                };
+
+                pixel[0] = final_r;
+                pixel[1] = final_g;
+                pixel[2] = final_b;
+            });
+        }
+        Intermediate::FourColor(pixels) => {
+            pixels.data.iter_mut().for_each(|pixel| {
+                pixel.iter_mut().for_each(|channel| {
+                    let mut linear = *channel * rescale_factor;
+                    if is_linear_format {
+                        linear = srgb_to_linear(linear.clamp(0.0, 1.0));
+                    }
+                    *channel = linear;
+                });
+            });
+        }
+    }
+
+    let mut dynamic = apply_orientation(intermediate_to_dynamic_image(developed)?, orientation);
+    remove_raw_artifacts_and_enhance(&mut dynamic);
+
+    Ok(dynamic)
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(3.0)
+    }
 }
 
 fn apply_orientation(image: DynamicImage, orientation: Orientation) -> DynamicImage {
@@ -4167,22 +4268,192 @@ fn apply_orientation(image: DynamicImage, orientation: Orientation) -> DynamicIm
 }
 
 fn intermediate_to_dynamic_image(intermediate: Intermediate) -> Result<DynamicImage, String> {
-    let image = intermediate
-        .to_dynamic_image()
-        .ok_or_else(|| "Failed to convert RAW intermediate to image".to_string())?;
-
-    Ok(match image {
-        DynamicImage::ImageRgb16(rgb) => DynamicImage::ImageRgb16(rgb),
-        DynamicImage::ImageRgba16(rgba) => DynamicImage::ImageRgba16(rgba),
-        DynamicImage::ImageLuma16(luma) => {
-            let rgb = RgbImage::from_fn(luma.width(), luma.height(), |x, y| {
-                let value = (luma.get_pixel(x, y)[0] >> 8) as u8;
-                ::image::Rgb([value, value, value])
+    match intermediate {
+        Intermediate::ThreeColor(pixels) => {
+            let dim = pixels.dim();
+            let width = dim.w as u32;
+            let height = dim.h as u32;
+            let buffer = ImageBuffer::<Rgba<f32>, _>::from_fn(width, height, |x, y| {
+                let pixel = pixels.data[(y * width + x) as usize];
+                Rgba([pixel[0], pixel[1], pixel[2], 1.0])
             });
-            DynamicImage::ImageRgb8(rgb)
+            Ok(DynamicImage::ImageRgba32F(buffer))
         }
-        other => other,
-    })
+        Intermediate::Monochrome(pixels) => {
+            let dim = pixels.dim();
+            let width = dim.w as u32;
+            let height = dim.h as u32;
+            let buffer = ImageBuffer::<Rgba<f32>, _>::from_fn(width, height, |x, y| {
+                let pixel = pixels.data[(y * width + x) as usize];
+                Rgba([pixel, pixel, pixel, 1.0])
+            });
+            Ok(DynamicImage::ImageRgba32F(buffer))
+        }
+        other => other
+            .to_dynamic_image()
+            .ok_or_else(|| "Failed to convert RAW intermediate to image".to_string()),
+    }
+}
+
+fn load_standard_image(path: &Path) -> Result<DynamicImage, String> {
+    let image = open_image(path).map_err(|error| error.to_string())?;
+    Ok(DynamicImage::ImageRgb32F(image.to_rgb32f()))
+}
+
+#[inline(always)]
+fn rgb_to_yc_only(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let y = 0.299 * r + 0.587 * g + 0.114 * b;
+    let cb = -0.168_736 * r - 0.331_264 * g + 0.5 * b;
+    let cr = 0.5 * r - 0.418_688 * g - 0.081_312 * b;
+    (y, cb, cr)
+}
+
+#[inline(always)]
+fn yc_to_rgb(y: f32, cb: f32, cr: f32) -> (f32, f32, f32) {
+    let r = y + 1.402 * cr;
+    let g = y - 0.344_136 * cb - 0.714_136 * cr;
+    let b = y + 1.772 * cb;
+    (r, g, b)
+}
+
+fn remove_raw_artifacts_and_enhance(image: &mut DynamicImage) {
+    let mut buffer = image.to_rgb32f();
+    let width = buffer.width() as usize;
+    let height = buffer.height() as usize;
+
+    let mut ycbcr_buffer = vec![0.0_f32; width * height * 3];
+    let src = buffer.as_raw();
+
+    for (dest, pixel) in ycbcr_buffer.chunks_mut(3).zip(src.chunks(3)) {
+        let (y, cb, cr) = rgb_to_yc_only(pixel[0], pixel[1], pixel[2]);
+        dest[0] = y;
+        dest[1] = cb;
+        dest[2] = cr;
+    }
+
+    const BASE_INV_SIGMA: f32 = 14.0;
+    const OFFSETS: [isize; 3] = [-5, -1, 3];
+    const OFFSET_SQUARES: [f32; 3] = [25.0, 1.0, 9.0];
+
+    for y in 0..height {
+        let row_offset = y * width;
+        for x in 0..width {
+            let center_idx = (row_offset + x) * 3;
+            let cy = ycbcr_buffer[center_idx];
+            let ccb = ycbcr_buffer[center_idx + 1];
+            let ccr = ycbcr_buffer[center_idx + 2];
+
+            let mut cb_sum = 0.0;
+            let mut cr_sum = 0.0;
+            let mut weight_sum = 0.0;
+
+            for (ky_index, &ky) in OFFSETS.iter().enumerate() {
+                let sy = y as isize + ky;
+                if sy < 0 || sy >= height as isize {
+                    continue;
+                }
+
+                let neighbor_row_idx = sy as usize * width;
+                let ky_sq_div_50 = OFFSET_SQUARES[ky_index] * 0.02;
+
+                for (kx_index, &kx) in OFFSETS.iter().enumerate() {
+                    let sx = x as isize + kx;
+                    if sx < 0 || sx >= width as isize {
+                        continue;
+                    }
+
+                    let neighbor_idx = (neighbor_row_idx + sx as usize) * 3;
+                    let neighbor_y = ycbcr_buffer[neighbor_idx];
+                    let y_diff = (cy - neighbor_y).abs();
+
+                    let val = y_diff * BASE_INV_SIGMA;
+                    let spatial_penalty = OFFSET_SQUARES[kx_index] * 0.02 + ky_sq_div_50;
+                    let weight = 1.0 / (1.0 + val * val + spatial_penalty);
+
+                    cb_sum += ycbcr_buffer[neighbor_idx + 1] * weight;
+                    cr_sum += ycbcr_buffer[neighbor_idx + 2] * weight;
+                    weight_sum += weight;
+                }
+            }
+
+            let (out_cb, out_cr) = if weight_sum > 1e-4 {
+                let inv_weight_sum = 1.0 / weight_sum;
+                let filtered_cb = cb_sum * inv_weight_sum;
+                let filtered_cr = cr_sum * inv_weight_sum;
+
+                let orig_mag_sq = ccb * ccb + ccr * ccr;
+                let filt_mag_sq = filtered_cb * filtered_cb + filtered_cr * filtered_cr;
+
+                if filt_mag_sq > orig_mag_sq && orig_mag_sq > 1e-12 {
+                    let scale = (orig_mag_sq / filt_mag_sq).sqrt();
+                    (filtered_cb * scale, filtered_cr * scale)
+                } else {
+                    (filtered_cb, filtered_cr)
+                }
+            } else {
+                (ccb, ccr)
+            };
+
+            let (r, g, b) = yc_to_rgb(cy, out_cb, out_cr);
+            let pixel = buffer.get_pixel_mut(x as u32, y as u32);
+            *pixel = Rgb([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]);
+        }
+    }
+
+    apply_gentle_detail_enhance(&mut buffer, &ycbcr_buffer, 0.35);
+    *image = DynamicImage::ImageRgb32F(buffer);
+}
+
+fn apply_gentle_detail_enhance(
+    buffer: &mut ImageBuffer<Rgb<f32>, Vec<f32>>,
+    ycbcr_source: &[f32],
+    amount: f32,
+) {
+    let width = buffer.width() as usize;
+    let height = buffer.height() as usize;
+    let mut temp_blur = vec![0.0_f32; width * height];
+    let radius = 2_i32;
+
+    for y in 0..height {
+        let row_offset = y * width;
+        for x in 0..width {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for kx in -radius..=radius {
+                let sx = (x as i32 + kx).clamp(0, width as i32 - 1) as usize;
+                sum += ycbcr_source[(row_offset + sx) * 3];
+                count += 1;
+            }
+            temp_blur[row_offset + x] = sum / count as f32;
+        }
+    }
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut blur_sum = 0.0;
+            let mut count = 0;
+            for ky in -radius..=radius {
+                let sy = (y as i32 + ky).clamp(0, height as i32 - 1) as usize;
+                blur_sum += temp_blur[sy * width + x];
+                count += 1;
+            }
+            let blurred_val = blur_sum / count as f32;
+            let original_luma = ycbcr_source[(y * width + x) * 3];
+            let detail = original_luma - blurred_val;
+            let edge_strength = detail.abs();
+            let adaptive_amount = if edge_strength > 0.1 {
+                amount * 0.3
+            } else {
+                amount
+            };
+            let boost = detail * adaptive_amount;
+
+            let pixel = buffer.get_pixel_mut(x as u32, y as u32);
+            pixel.0[0] = (pixel.0[0] + boost).clamp(0.0, 1.0);
+            pixel.0[1] = (pixel.0[1] + boost).clamp(0.0, 1.0);
+            pixel.0[2] = (pixel.0[2] + boost).clamp(0.0, 1.0);
+        }
+    }
 }
 
 fn repo_root() -> PathBuf {
@@ -5518,7 +5789,8 @@ fn load_full_resolution_image(path: &Path, is_raw: bool) -> Result<DynamicImage,
     if is_raw {
         decode_raw_preview(path)
     } else {
-        open_image(path).map_err(|error| format!("Failed to open {}: {}", path.display(), error))
+        load_standard_image(path)
+            .map_err(|error| format!("Failed to open {}: {}", path.display(), error))
     }
 }
 
