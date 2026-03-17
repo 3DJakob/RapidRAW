@@ -2,7 +2,7 @@
   "version": 1,
   "rating": 1,
   "adjustments": {
-    "aspectRatio": null,
+    "aspectRatio": 0.75,
     "blacks": 0.0,
     "brightness": 0.0,
     "centré": 0.0,
@@ -39,7 +39,12 @@
     },
     "colorNoiseReduction": 0.0,
     "contrast": 0.0,
-    "crop": null,
+    "crop": {
+      "height": 1352.1014404296875,
+      "width": 1014.0761108398438,
+      "x": 299.7742614746094,
+      "y": 258.84405517578125
+    },
     "curves": {
       "blue": [
         {
@@ -141,7 +146,7 @@
     "lutPath": null,
     "lutSize": 0,
     "orientationSteps": 0,
-    "rotation": 0.0,
+    "rotation": -13.799999237060547,
     "saturation": 0.0,
     "shadows": 0.0,
     "sharpness": 0.0,
