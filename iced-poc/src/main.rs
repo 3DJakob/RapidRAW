@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-const BASE_CROP_RATIO: f32 = 1.618;
 const CROP_RATIO_TOLERANCE: f32 = 0.01;
 
 fn main() -> iced::Result {
@@ -182,6 +181,7 @@ struct App {
     basic_adjustments: BasicAdjustments,
     crop_custom_width: String,
     crop_custom_height: String,
+    crop_custom_active: bool,
     crop_ruler_active: bool,
     lut_browser: LutBrowserState,
     rendered_preview: Option<image::Handle>,
@@ -912,6 +912,7 @@ impl App {
             basic_adjustments: BasicAdjustments::default(),
             crop_custom_width: String::new(),
             crop_custom_height: String::new(),
+            crop_custom_active: false,
             crop_ruler_active: false,
             lut_browser: LutBrowserState::default(),
             rendered_preview: None,
@@ -1086,26 +1087,46 @@ impl App {
                 }
             }
             Message::CropPresetSelected(preset) => {
+                self.crop_custom_active = false;
                 let new_ratio = match preset {
                     CropPresetKind::Free => None,
                     CropPresetKind::Original => self.active_original_crop_ratio(),
                     CropPresetKind::Ratio(value) => Some(value),
                 };
-                self.apply_crop_ratio_to_selected(new_ratio);
+                self.apply_crop_ratio_to_selected(new_ratio, false);
                 return self.request_preview_render(PreviewQuality::Full);
             }
             Message::CropCustomWidthChanged(value) => {
                 self.crop_custom_width = value;
+                if self.crop_custom_active
+                    && let Some(new_ratio) = parse_custom_crop_ratio(
+                        &self.crop_custom_width,
+                        &self.crop_custom_height,
+                    )
+                {
+                    self.apply_crop_ratio_to_selected(Some(new_ratio), true);
+                    return self.request_preview_render(PreviewQuality::Interactive);
+                }
             }
             Message::CropCustomHeightChanged(value) => {
                 self.crop_custom_height = value;
+                if self.crop_custom_active
+                    && let Some(new_ratio) = parse_custom_crop_ratio(
+                        &self.crop_custom_width,
+                        &self.crop_custom_height,
+                    )
+                {
+                    self.apply_crop_ratio_to_selected(Some(new_ratio), true);
+                    return self.request_preview_render(PreviewQuality::Interactive);
+                }
             }
             Message::ApplyCustomCropRatio => {
                 if let Some(new_ratio) = parse_custom_crop_ratio(
                     &self.crop_custom_width,
                     &self.crop_custom_height,
                 ) {
-                    self.apply_crop_ratio_to_selected(Some(new_ratio));
+                    self.crop_custom_active = true;
+                    self.apply_crop_ratio_to_selected(Some(new_ratio), true);
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
@@ -1113,7 +1134,7 @@ impl App {
                 if let Some(ratio) = self.basic_adjustments.aspect_ratio
                     && ratio > 0.0
                 {
-                    self.apply_crop_ratio_to_selected(Some(1.0 / ratio));
+                    self.apply_crop_ratio_to_selected(Some(1.0 / ratio), false);
                     return self.request_preview_render(PreviewQuality::Full);
                 }
             }
@@ -2152,10 +2173,31 @@ impl App {
             let width = ratio * height;
             self.crop_custom_width = trim_ratio_value(width);
             self.crop_custom_height = trim_ratio_value(height);
+            self.crop_custom_active = self.is_custom_crop_ratio(Some(ratio));
         } else {
             self.crop_custom_width.clear();
             self.crop_custom_height.clear();
+            self.crop_custom_active = false;
         }
+    }
+
+    fn is_custom_crop_ratio(&self, ratio: Option<f32>) -> bool {
+        let Some(ratio) = ratio else {
+            return false;
+        };
+
+        let original = self.active_original_crop_ratio();
+        !matches!(
+            ratio,
+            value
+                if ratio_matches(Some(value), 1.0)
+                    || ratio_matches(Some(value), 5.0 / 4.0)
+                    || ratio_matches(Some(value), 4.0 / 3.0)
+                    || ratio_matches(Some(value), 3.0 / 2.0)
+                    || ratio_matches(Some(value), 16.0 / 9.0)
+                    || ratio_matches(Some(value), 21.0 / 9.0)
+                    || matches!((Some(value), original), (Some(current), Some(original_ratio)) if (current - original_ratio).abs() < CROP_RATIO_TOLERANCE)
+        )
     }
 
     fn active_original_crop_ratio(&self) -> Option<f32> {
@@ -2168,7 +2210,7 @@ impl App {
         .map(|(width, height)| width as f32 / height.max(1) as f32)
     }
 
-    fn apply_crop_ratio_to_selected(&mut self, new_ratio: Option<f32>) {
+    fn apply_crop_ratio_to_selected(&mut self, new_ratio: Option<f32>, preserve_custom_inputs: bool) {
         self.finish_pending_drag_undo();
         let selected = if self.selected_indices.is_empty() {
             vec![self.selected_index]
@@ -2211,7 +2253,9 @@ impl App {
 
         if let Some(sample) = self.samples.get(self.selected_index) {
             self.basic_adjustments = sample.adjustments.clone();
-            self.sync_crop_custom_inputs();
+            if !preserve_custom_inputs {
+                self.sync_crop_custom_inputs();
+            }
         }
     }
 
@@ -2818,9 +2862,9 @@ impl App {
                             Message::CropPresetSelected(CropPresetKind::Ratio(21.0 / 9.0)),
                         ),
                         crop_choice_button(
-                            "Golden",
-                            ratio_matches(ratio, BASE_CROP_RATIO),
-                            Message::CropPresetSelected(CropPresetKind::Ratio(BASE_CROP_RATIO)),
+                            "Custom",
+                            self.crop_custom_active,
+                            Message::ApplyCustomCropRatio,
                         ),
                     ]
                     .spacing(8),
@@ -2830,6 +2874,7 @@ impl App {
                             .on_submit(Message::ApplyCustomCropRatio)
                             .padding([10, 12])
                             .size(14)
+                            .style(filled_text_input_style)
                             .width(Length::Fill),
                         text("×").size(14).color(Color::from_rgb8(0x8d, 0x98, 0xae)),
                         text_input("H", &self.crop_custom_height)
@@ -2837,6 +2882,7 @@ impl App {
                             .on_submit(Message::ApplyCustomCropRatio)
                             .padding([10, 12])
                             .size(14)
+                            .style(filled_text_input_style)
                             .width(Length::Fill),
                     ]
                     .spacing(8)
@@ -5987,6 +6033,22 @@ fn tone_mapper_button<'a>(
         })
         .on_press(Message::ToneMapperChanged(value))
         .into()
+}
+
+fn filled_text_input_style(
+    theme: &Theme,
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    let mut style = iced::widget::text_input::default(theme, status);
+    style.background = Background::Color(Color::from_rgb8(0x21, 0x28, 0x35));
+    style.border.radius = 12.0.into();
+    style.border.width = 0.0;
+    style.border.color = Color::TRANSPARENT;
+    style.icon = Color::from_rgb8(0xa8, 0xb2, 0xc8);
+    style.placeholder = Color::from_rgb8(0x7f, 0x89, 0x9d);
+    style.value = Color::from_rgb8(0xe7, 0xec, 0xf6);
+    style.selection = Color::from_rgba8(0x24, 0x5d, 0x88, 0.45);
+    style
 }
 
 fn curve_channel_button<'a>(
